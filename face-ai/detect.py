@@ -22,6 +22,32 @@ SNAPSHOT_DIR   = os.path.join(HERE, 'snapshots')
 FACE_MODEL_PATH = os.path.join(HERE, 'blaze_face_short_range.tflite')
 YOLO_MODEL_PATH = os.path.join(HERE, 'yolov8n.pt') # Standard nano model
 FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
+# Optional Bangla license-plate detector — YOLO weights fine-tuned on BD plates.
+# When missing we fall back to contour-based ROI extraction on vehicle crops.
+PLATE_MODEL_PATH = os.path.join(HERE, 'plate_model.pt')
+
+# ── Loitering ──────────────────────────────────────────────────
+# A tracked person that stays in-frame longer than this is flagged as loitering.
+# Increase for slow-turnover areas (bank lobbies, ATMs); decrease for corridors.
+LOITERING_SECONDS = float(os.environ.get('LOITERING_SECONDS', '30'))
+# How long a track can be missing before we forget its start time. Prevents a
+# person who briefly walks out of frame and comes back from being "reset".
+LOITERING_TRACK_TTL_S = 5.0
+# Throttle repeated loitering incident envelopes for the same track.
+LOITERING_INCIDENT_THROTTLE_S = 15.0
+
+# ── License plates ────────────────────────────────────────────
+# Vehicle classes YOLO's base model knows about — the plate pipeline is only
+# invoked on crops that match one of these.
+VEHICLE_CLASSES = {'car', 'truck', 'bus', 'motorcycle'}
+# OCR is expensive; only sample this often per vehicle track.
+PLATE_OCR_INTERVAL_S = 1.5
+# Minimum EasyOCR confidence for a plate reading to be accepted at all.
+PLATE_MIN_CONF = 0.35
+# A plate string only "sticks" (published as a detection with name= set and
+# persisted as an incident) after the same reading wins the per-track vote for
+# this many observations. Suppresses one-off OCR hallucinations.
+PLATE_CONFIRM_READS = 2
 
 # When fire/smoke or a recognized face appears, save a JPEG of the (full-res)
 # frame with boxes burned in. Throttles are PER trigger type so a steady
@@ -96,6 +122,153 @@ else:
 
 yolo_lock = threading.Lock()
 
+# ── Bangla license-plate detector + OCR ───────────────────────
+# Optional YOLO weights for plates. When absent we fall back to contour ROI
+# extraction inside each vehicle box (cheaper, noisier).
+plate_model = None
+if os.path.exists(PLATE_MODEL_PATH) and os.path.getsize(PLATE_MODEL_PATH) > 1000000:
+    try:
+        plate_model = YOLO(PLATE_MODEL_PATH)
+        log({'type': 'info', 'message': 'Custom Plate Model loaded'})
+    except Exception as e:
+        log({'type': 'warning', 'message': f'Failed to load plate model: {e}'})
+else:
+    log({'type': 'info', 'message': 'No plate_model.pt found — using contour-based plate ROI extraction.'})
+plate_model_lock = threading.Lock()
+
+# EasyOCR is loaded lazily on first plate detection to keep startup fast and
+# to make the whole plate feature optional. If the module isn't installed we
+# still detect plate regions but leave `name` null.
+ocr_reader = None
+ocr_reader_lock = threading.Lock()
+_ocr_import_failed = False
+
+def get_ocr_reader():
+    """Return a cached EasyOCR reader for Bangla + English, or None if unavailable."""
+    global ocr_reader, _ocr_import_failed
+    if ocr_reader is not None or _ocr_import_failed:
+        return ocr_reader
+    with ocr_reader_lock:
+        if ocr_reader is not None or _ocr_import_failed:
+            return ocr_reader
+        try:
+            import easyocr  # heavy — 1.5GB with weights on first run
+            log({'type': 'info', 'message': 'Loading EasyOCR (bn+en) — first run downloads weights'})
+            ocr_reader = easyocr.Reader(['bn', 'en'], gpu=torch.cuda.is_available())
+            log({'type': 'info', 'message': 'EasyOCR ready'})
+        except Exception as e:
+            _ocr_import_failed = True
+            log({'type': 'warning', 'message': f'EasyOCR unavailable ({e}) — plate numbers will not be read. `pip install easyocr` to enable.'})
+        return ocr_reader
+
+
+def find_plate_rois(vehicle_bgr):
+    """Contour-based fallback: return candidate plate crops from a vehicle image.
+
+    Filters by aspect ratio (BD plates are wider than tall, ~2:1 to 6:1) and
+    a minimum absolute size to reject noise. Returns a list of (x, y, w, h)
+    tuples in the vehicle-crop coordinate system, sorted by area descending.
+    """
+    if vehicle_bgr is None or vehicle_bgr.size == 0:
+        return []
+    vh, vw = vehicle_bgr.shape[:2]
+    if vw < 40 or vh < 40:
+        return []
+    gray = cv2.cvtColor(vehicle_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 5, 40, 40)
+    edges = cv2.Canny(gray, 60, 180)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5)))
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    min_w = max(30, vw // 10)
+    min_h = max(10, vh // 20)
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < min_w or h < min_h: continue
+        ar = w / float(h)
+        if ar < 1.8 or ar > 6.5: continue
+        if w * h > vw * vh * 0.5: continue  # too big to be a plate
+        # Bias toward the lower half of the vehicle where plates usually sit.
+        if y + h < vh * 0.25: continue
+        out.append((x, y, w, h))
+    out.sort(key=lambda r: r[2] * r[3], reverse=True)
+    return out[:3]  # top-3 candidates per vehicle
+
+
+_PLATE_CLEAN_RE = re.compile(r'[^0-9A-Za-z\u0980-\u09FF\- ]+')
+
+def clean_plate_text(text):
+    """Normalize an OCR string: strip junk chars, collapse whitespace, upper-case Latin.
+
+    Keeps Bengali code block (U+0980..U+09FF), ASCII letters/digits, hyphen, and
+    spaces. Everything else is dropped so noisy borders don't get baked into
+    the key used for the per-track voting buffer.
+    """
+    if not text: return ''
+    t = _PLATE_CLEAN_RE.sub(' ', text)
+    t = re.sub(r'\s+', ' ', t).strip()
+    # Latin portion is conventionally upper-case on BD plates ("METRO GA").
+    return ''.join(ch.upper() if ch.isascii() and ch.isalpha() else ch for ch in t)
+
+
+def detect_plates_in_vehicle(vehicle_bgr):
+    """Return a list of {box:(x,y,w,h), text:str, conf:float} for a vehicle crop.
+
+    Uses `plate_model` when present; otherwise falls back to contour ROIs.
+    OCR is applied to each candidate crop. `text` may be '' if OCR failed
+    or is unavailable — the caller can still surface the plate box.
+    """
+    if vehicle_bgr is None or vehicle_bgr.size == 0:
+        return []
+    vh, vw = vehicle_bgr.shape[:2]
+    candidates = []  # list of (x, y, w, h)
+
+    if plate_model is not None:
+        try:
+            with plate_model_lock:
+                res = plate_model(vehicle_bgr, verbose=False)[0]
+            for box in res.boxes:
+                conf = float(box.conf[0])
+                if conf < 0.35: continue
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(vw, x2); y2 = min(vh, y2)
+                if x2 - x1 > 10 and y2 - y1 > 5:
+                    candidates.append((x1, y1, x2 - x1, y2 - y1))
+        except Exception as ex:
+            log({'type': 'warning', 'message': f'Plate model inference failed: {ex}'})
+
+    if not candidates:
+        candidates = find_plate_rois(vehicle_bgr)
+
+    reader = get_ocr_reader()
+    out = []
+    for (x, y, w, h) in candidates:
+        crop = vehicle_bgr[y:y+h, x:x+w]
+        text = ''
+        conf = 0.0
+        if reader is not None and crop.size > 0:
+            try:
+                # `paragraph=True` merges the two lines a BD plate is split
+                # across (city+metro/type on top, number on bottom) into a
+                # single string that survives the per-track voting buffer.
+                results = reader.readtext(crop, detail=1, paragraph=False)
+                # Pick the highest-confidence line — for two-line BD plates we
+                # concatenate the top-2 by y so "ঢাকা মেট্রো-গ ১১-১২৩৪" survives.
+                if results:
+                    results.sort(key=lambda r: r[2] if len(r) > 2 else 0, reverse=True)
+                    top = [r for r in results if len(r) > 2 and r[2] >= PLATE_MIN_CONF][:2]
+                    if top:
+                        # Order by vertical position (top → bottom) then join.
+                        top.sort(key=lambda r: min(pt[1] for pt in r[0]))
+                        text = clean_plate_text(' '.join(r[1] for r in top))
+                        conf = float(sum(r[2] for r in top) / len(top))
+            except Exception as ex:
+                log({'type': 'warning', 'message': f'OCR failed: {ex}'})
+        out.append({'box': (x, y, w, h), 'text': text, 'conf': conf})
+    return out
+
 # ── FaceNet (vggface2) embedder ─────────────────────────────────
 # 27M-param InceptionResnetV1 from facenet-pytorch. Outputs L2-normalized
 # 512-d embeddings; cosine similarity = dot product.
@@ -130,16 +303,26 @@ def save_snapshot(stream_id, frame, detections, incidents):
     h, w = frame.shape[:2]
     img = frame.copy()
 
-    # Recognized faces / persons (regular detections).
+    # Recognized faces / persons / vehicles / plates / loitering.
     for d in (detections or []):
         x1 = int(max(0, d['x']) * w)
         y1 = int(max(0, d['y']) * h)
         x2 = int(min(1, d['x'] + d['w']) * w)
         y2 = int(min(1, d['y'] + d['h']) * h)
-        if d.get('name'):
+        lab = d.get('label')
+        if d.get('loitering'):
+            color = (0, 165, 255)   # orange-red — loitering warning
+            label = f"LOITERING {d.get('dwellSeconds', '')}s"
+        elif lab == 'plate':
+            color = (255, 200, 0)   # cyan-ish for plates
+            label = d.get('name') or 'plate'
+        elif lab == 'vehicle':
+            color = (200, 200, 200)
+            label = d.get('vehicleType') or 'vehicle'
+        elif d.get('name'):
             color = (16, 185, 129)  # emerald BGR-ish
             label = d['name']
-        elif d.get('label') == 'person':
+        elif lab == 'person':
             color = (11, 158, 245)  # amber
             label = 'person'
         else:
@@ -149,16 +332,26 @@ def save_snapshot(stream_id, frame, detections, incidents):
         cv2.putText(img, label, (x1, max(15, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
-    # Fire/smoke incidents (corners format).
+    # Incident boxes (fire/smoke/loitering/plate) — corners format.
+    incident_colors = {
+        'fire':      (68, 68, 239),
+        'smoke':     (68, 68, 239),
+        'loitering': (0, 165, 255),
+        'plate':     (255, 200, 0),
+    }
     for inc in (incidents or []):
         bx = inc.get('box') or []
         if len(bx) < 4: continue
         x1 = int(max(0, bx[0]) * w); y1 = int(max(0, bx[1]) * h)
         x2 = int(min(1, bx[2]) * w); y2 = int(min(1, bx[3]) * h)
-        cv2.rectangle(img, (x1, y1), (x2, y2), (68, 68, 239), 3)
-        cv2.putText(img, str(inc.get('type', 'alert')).upper(),
-                    (x1, max(20, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (68, 68, 239), 2, cv2.LINE_AA)
+        color = incident_colors.get(inc.get('type'), (68, 68, 239))
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+        tag = str(inc.get('type', 'alert')).upper()
+        if inc.get('plate'): tag = f"PLATE {inc['plate']}"
+        elif inc.get('type') == 'loitering' and inc.get('dwellSeconds'):
+            tag = f"LOITERING {inc['dwellSeconds']}s"
+        cv2.putText(img, tag, (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA)
 
     stream_dir = os.path.join(SNAPSHOT_DIR, stream_id)
     try: os.makedirs(stream_dir, exist_ok=True)
@@ -327,6 +520,20 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     fire_prev_sig = None  # (cx, cy, area) of last frame's best flame candidate
     fire_streak   = 0     # consecutive frames the candidate has flickered/moved
 
+    # ── Loitering state: track_id -> first-seen / last-seen / last-alert ──
+    # ByteTrack IDs are stable within one continuous track. `first_seen` is
+    # frozen; `last_seen` advances every frame the track is visible; a track
+    # that disappears for LOITERING_TRACK_TTL_S is forgotten so the next
+    # reappearance starts a fresh timer.
+    loitering_state = {}   # track_id -> {'first': ts, 'last': ts, 'alerted_at': ts, 'box': (x,y,w,h)}
+
+    # ── Plate state: vehicle_track_id -> {'last_ocr_at': ts, 'votes': {str: int}, 'plate': str|None, 'reads': int} ──
+    # We only run OCR every PLATE_OCR_INTERVAL_S per track, then vote the
+    # dominant cleaned string over PLATE_CONFIRM_READS observations before
+    # publishing it. Same TTL-cleanup pattern as loitering.
+    plate_state = {}
+    plate_reported_at = {}  # cleaned_plate_string -> last-emitted timestamp (throttling)
+
     reader = LatestFrameReader(rtsp_url)
     try:
         while not stop_event.is_set():
@@ -436,29 +643,74 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
             incidents = []
             try:
                 with yolo_lock:
-                    # Run YOLOv8 on small frame
-                    yolo_results = yolo_model(small_frame, verbose=False)[0]
-                
+                    # `track` (ByteTrack) with `persist=True` keeps track IDs stable
+                    # across frames — required for loitering dwell timers and
+                    # per-vehicle plate OCR voting. Falls back to detections
+                    # without IDs on tracker init glitches.
+                    try:
+                        yolo_results = yolo_model.track(small_frame, persist=True,
+                                                       tracker='bytetrack.yaml',
+                                                       verbose=False)[0]
+                    except Exception:
+                        yolo_results = yolo_model(small_frame, verbose=False)[0]
+
                     people = []
+                    vehicles = []  # (track_id, x1_px, y1_px, x2_px, y2_px, label) on small_frame coords
                     for box in yolo_results.boxes:
                         cls_id = int(box.cls[0])
                         conf = float(box.conf[0])
                         if conf < 0.6: continue # Increased from 0.3 to reduce false persons
-                    
+
                         label = yolo_model.names[cls_id]
                         bx = box.xyxyn[0].tolist() # [x1, y1, x2, y2]
-                    
+                        # ByteTrack IDs are attached to `.id` when tracking succeeds.
+                        track_id = None
+                        if getattr(box, 'id', None) is not None:
+                            try: track_id = int(box.id.item() if hasattr(box.id, 'item') else box.id[0])
+                            except Exception: track_id = None
+
                         if label == 'person':
                             # Ignore very small boxes that are likely false positives (hands, etc.)
                             bw = bx[2] - bx[0]
                             bh = bx[3] - bx[1]
-                            if bw * bh < 0.05: continue 
-                        
+                            if bw * bh < 0.05: continue
+
                             people.append(bx)
+                            det = {
+                                'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
+                                'confidence': conf, 'label': 'person',
+                            }
+                            if track_id is not None:
+                                det['trackId'] = track_id
+                            detections.append(det)
+
+                            # Loitering: only meaningful when we have a stable ID.
+                            if track_id is not None:
+                                st = loitering_state.get(track_id)
+                                if st is None:
+                                    loitering_state[track_id] = {
+                                        'first': now, 'last': now,
+                                        'alerted_at': 0.0,
+                                        'box': (bx[0], bx[1], bw, bh),
+                                    }
+                                else:
+                                    st['last'] = now
+                                    st['box'] = (bx[0], bx[1], bw, bh)
+
+                        elif label in VEHICLE_CLASSES:
+                            bw = bx[2] - bx[0]
+                            bh = bx[3] - bx[1]
+                            if bw * bh < 0.01: continue  # tiny vehicles = OCR noise
                             detections.append({
                                 'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
-                                'confidence': conf, 'label': 'person'
+                                'confidence': conf, 'label': 'vehicle', 'vehicleType': label,
+                                **({'trackId': track_id} if track_id is not None else {}),
                             })
+                            # Convert normalized coords back to small_frame pixels for cropping.
+                            x1_px = int(max(0, bx[0]) * w); y1_px = int(max(0, bx[1]) * h)
+                            x2_px = int(min(1, bx[2]) * w); y2_px = int(min(1, bx[3]) * h)
+                            vehicles.append((track_id, x1_px, y1_px, x2_px, y2_px, label))
+
                         elif label in ['fire', 'smoke']: # In case custom model is used or standard detects them
                             incidents.append({'type': 'fire', 'confidence': conf, 'box': bx})
 
@@ -553,14 +805,129 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
             except Exception as ex:
                 log({'type': 'warning', 'message': f'YOLO error: {ex}'})
 
+            # 3. Loitering resolution — for every tracked person, check dwell
+            # time and emit both a `loitering` label on the detection (so the
+            # frontend can color-code) and an `incidents` envelope entry (so
+            # the backend persists it) when the threshold is crossed.
+            try:
+                for tid, st in list(loitering_state.items()):
+                    if now - st['last'] > LOITERING_TRACK_TTL_S:
+                        del loitering_state[tid]
+                        continue
+                    dwell = now - st['first']
+                    if dwell < LOITERING_SECONDS:
+                        continue
+                    # Tag any person detection with the same trackId as "loitering"
+                    # so the frontend can draw it in the loitering color.
+                    for d in detections:
+                        if d.get('label') == 'person' and d.get('trackId') == tid:
+                            d['loitering'] = True
+                            d['dwellSeconds'] = round(dwell, 1)
+                    # Throttled incident envelope: one entry per track per window.
+                    if now - st['alerted_at'] >= LOITERING_INCIDENT_THROTTLE_S:
+                        st['alerted_at'] = now
+                        x0, y0, bw0, bh0 = st['box']
+                        incidents.append({
+                            'type': 'loitering',
+                            'confidence': min(1.0, dwell / (LOITERING_SECONDS * 2)),
+                            'box': [x0, y0, x0 + bw0, y0 + bh0],
+                            'trackId': tid,
+                            'dwellSeconds': round(dwell, 1),
+                        })
+            except Exception as ex:
+                log({'type': 'warning', 'message': f'Loitering resolution failed: {ex}'})
+
+            # 4. License plate detection + OCR — sampled per vehicle track.
+            # A vehicle without a stable trackId can't be voted across frames,
+            # so we only OCR tracked vehicles. OCR is throttled per track and
+            # a plate string only sticks after PLATE_CONFIRM_READS agreements.
+            try:
+                # Age out plate state for vehicles that have vanished.
+                for tid in list(plate_state.keys()):
+                    if now - plate_state[tid].get('last_ocr_at', 0) > 10.0:
+                        del plate_state[tid]
+
+                for (tid, x1_px, y1_px, x2_px, y2_px, veh_label) in vehicles:
+                    if tid is None: continue
+                    ps = plate_state.setdefault(tid, {
+                        'last_ocr_at': 0.0, 'votes': {}, 'plate': None, 'reads': 0,
+                    })
+                    if now - ps['last_ocr_at'] < PLATE_OCR_INTERVAL_S:
+                        # No OCR this tick — but if we already confirmed a plate
+                        # for this track, keep publishing it so the frontend
+                        # renders the label continuously while the car is in view.
+                        if ps['plate']:
+                            detections.append({
+                                'x': x1_px / w, 'y': y1_px / h,
+                                'w': (x2_px - x1_px) / w, 'h': (y2_px - y1_px) / h,
+                                'confidence': 0.9, 'label': 'plate',
+                                'name': ps['plate'], 'trackId': tid,
+                            })
+                        continue
+                    ps['last_ocr_at'] = now
+                    crop = small_frame[y1_px:y2_px, x1_px:x2_px]
+                    plates = detect_plates_in_vehicle(crop)
+                    if not plates: continue
+                    # Best candidate per vehicle: highest OCR confidence with a
+                    # non-empty cleaned string. If none has text (OCR down), we
+                    # still emit a `plate` detection so the box is visible.
+                    plates.sort(key=lambda p: p['conf'], reverse=True)
+                    best = plates[0]
+                    px, py, pw, ph = best['box']
+                    # Convert plate coords from vehicle-crop-space back to full-frame normalized.
+                    plate_abs_x = (x1_px + px) / w
+                    plate_abs_y = (y1_px + py) / h
+                    plate_abs_w = pw / w
+                    plate_abs_h = ph / h
+
+                    text = best['text']
+                    published_name = ps['plate']  # what we've already confirmed
+                    if text:
+                        ps['votes'][text] = ps['votes'].get(text, 0) + 1
+                        ps['reads'] += 1
+                        # Winner = most-voted string so far.
+                        winner = max(ps['votes'].items(), key=lambda kv: kv[1])
+                        if winner[1] >= PLATE_CONFIRM_READS and winner[0] != ps['plate']:
+                            ps['plate'] = winner[0]
+                            published_name = winner[0]
+                            # Emit an `incidents` envelope for persistence, throttled
+                            # per plate string so a car sitting in view doesn't spam.
+                            last_report = plate_reported_at.get(winner[0], 0)
+                            if now - last_report >= 30.0:
+                                plate_reported_at[winner[0]] = now
+                                incidents.append({
+                                    'type': 'plate',
+                                    'confidence': best['conf'],
+                                    'box': [plate_abs_x, plate_abs_y,
+                                            plate_abs_x + plate_abs_w,
+                                            plate_abs_y + plate_abs_h],
+                                    'plate': winner[0],
+                                    'trackId': tid,
+                                    'vehicleType': veh_label,
+                                })
+
+                    detections.append({
+                        'x': plate_abs_x, 'y': plate_abs_y,
+                        'w': plate_abs_w, 'h': plate_abs_h,
+                        'confidence': best['conf'] or 0.5,
+                        'label': 'plate',
+                        'name': published_name,
+                        'trackId': tid,
+                    })
+            except Exception as ex:
+                log({'type': 'warning', 'message': f'Plate pipeline failed: {ex}'})
+
             # Snapshot decision — fire/smoke take priority and have their own,
             # tighter throttle; recognized faces are higher volume so the
             # throttle there is more generous. If both happen in the same
             # frame, the resulting snapshot satisfies both (boxes are drawn
             # for everything in the frame).
             snapshot_path = None
+            # `incidents` now covers fire/smoke/loitering/plate — all rate-limited
+            # via the tighter INCIDENT throttle. A recognized face without any
+            # incident still uses the more generous FACE throttle.
             has_incident = bool(incidents)
-            has_named_face = any(d.get('name') for d in detections)
+            has_named_face = any(d.get('label') == 'face' and d.get('name') for d in detections)
             now_t = time.time()
             incident_due = has_incident   and (now_t - last_incident_snap_at) >= INCIDENT_SNAPSHOT_THROTTLE_S
             face_due     = has_named_face and (now_t - last_face_snap_at)     >= FACE_SNAPSHOT_THROTTLE_S

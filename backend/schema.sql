@@ -123,15 +123,21 @@ INSERT IGNORE INTO users (id, username, password_hash) VALUES
 
 -- ── default detection features per user ─────────────────────────────────
 INSERT IGNORE INTO features (user_id, name, enabled, description) VALUES
-  (1, 'fire_detection',   1, 'Log fire/smoke incidents detected by the AI worker'),
-  (1, 'face_detection',   1, 'Log recognized face matches as incidents'),
-  (1, 'person_detection', 0, 'Log person presence (high volume — off by default)'),
-  (2, 'fire_detection',   1, 'Log fire/smoke incidents detected by the AI worker'),
-  (2, 'face_detection',   1, 'Log recognized face matches as incidents'),
-  (2, 'person_detection', 0, 'Log person presence (high volume — off by default)'),
-  (3, 'fire_detection',   1, 'Log fire/smoke incidents detected by the AI worker'),
-  (3, 'face_detection',   1, 'Log recognized face matches as incidents'),
-  (3, 'person_detection', 0, 'Log person presence (high volume — off by default)');
+  (1, 'fire_detection',       1, 'Log fire/smoke incidents detected by the AI worker'),
+  (1, 'face_detection',       1, 'Log recognized face matches as incidents'),
+  (1, 'person_detection',     0, 'Log person presence (high volume — off by default)'),
+  (1, 'loitering_detection',  1, 'Log persons that dwell in-frame beyond LOITERING_SECONDS (default 30s)'),
+  (1, 'plate_detection',      1, 'Log recognized Bangla / English license plates from vehicles in view'),
+  (2, 'fire_detection',       1, 'Log fire/smoke incidents detected by the AI worker'),
+  (2, 'face_detection',       1, 'Log recognized face matches as incidents'),
+  (2, 'person_detection',     0, 'Log person presence (high volume — off by default)'),
+  (2, 'loitering_detection',  1, 'Log persons that dwell in-frame beyond LOITERING_SECONDS (default 30s)'),
+  (2, 'plate_detection',      1, 'Log recognized Bangla / English license plates from vehicles in view'),
+  (3, 'fire_detection',       1, 'Log fire/smoke incidents detected by the AI worker'),
+  (3, 'face_detection',       1, 'Log recognized face matches as incidents'),
+  (3, 'person_detection',     0, 'Log person presence (high volume — off by default)'),
+  (3, 'loitering_detection',  1, 'Log persons that dwell in-frame beyond LOITERING_SECONDS (default 30s)'),
+  (3, 'plate_detection',      1, 'Log recognized Bangla / English license plates from vehicles in view');
 
 -- ── sample cameras (around Badda, Dhaka — across all 3 seeded users) ────
 -- Decorative only: the RTSP host `demo.local` doesn't resolve, so the

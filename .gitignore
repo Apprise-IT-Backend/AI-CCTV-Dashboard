@@ -65,6 +65,24 @@ mediamtx/*.m3u8
 mediamtx/*.ts
 mediamtx/*.mp4
 
+# FFmpeg — the agent auto-downloads this into agent/ on first Windows run.
+# 20-40 MB portable binary; other platforms install via brew/apt.
+agent/ffmpeg.exe
+agent/ffmpeg.zip
+agent/ffmpeg
+agent/ffprobe.exe
+agent/ffprobe
+
+# Runtime caches — regenerated every session, never worth committing.
+# Analyze Video: uploads + annotated outputs (hundreds of MB per job).
+face-ai/analyze_jobs/
+# Live pipeline: per-incident JPEG snapshots.
+face-ai/snapshots/
+
+# Log files (keep noise out of PRs)
+*.log
+logs/
+
 # Project Specific
 # Enrollments (Ignore user images but keep folder structure)
 face-ai/enrollments/*.jpg

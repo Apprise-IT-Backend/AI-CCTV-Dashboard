@@ -73,6 +73,9 @@ const DETECTION_COLORS = {
   face:       '#3b82f6',
   person:     '#f59e0b',
   incident:   '#ef4444',
+  loitering:  '#fb923c',   // orange — attention but softer than fire red
+  vehicle:    '#94a3b8',
+  plate:      '#22d3ee',   // cyan — reads well over both dark and light plates
 };
 
 // Box color when a recognized face has an enrollment category. Falls back to
@@ -86,7 +89,10 @@ const PERSON_TYPE_COLORS = {
 };
 
 function colorForDetection(d) {
-  if (d.name) {
+  if (d.loitering) return DETECTION_COLORS.loitering;
+  if (d.label === 'plate')   return DETECTION_COLORS.plate;
+  if (d.label === 'vehicle') return DETECTION_COLORS.vehicle;
+  if (d.name && d.label === 'face') {
     return PERSON_TYPE_COLORS[d.personType] || DETECTION_COLORS.recognized;
   }
   return d.label === 'person' ? DETECTION_COLORS.person : DETECTION_COLORS.face;
@@ -182,6 +188,13 @@ function connectSocket() {
       const desc = modal.querySelector('.modal-desc');
       if (desc) desc.textContent = message;
     }
+  });
+
+  // Offline video analyzer progress. The analyze module (below) is a plain
+  // object we hang on window so this listener works even when the Analyze
+  // page hasn't been rendered yet in the DOM.
+  socket.on('analyze_progress', (msg) => {
+    if (window.analyzeModule) window.analyzeModule.onProgress(msg);
   });
 }
 
@@ -564,9 +577,18 @@ function drawDetections(cam) {
     if (d.personType === 'threat') ctx.lineWidth = 3; else ctx.lineWidth = 1.5;
     ctx.strokeStyle = color;
     ctx.strokeRect(x, y, w, h);
-    const tag = d.name && d.personType && d.personType !== 'standard'
-      ? `${d.name} · ${d.personType}`
-      : (d.name || d.label);
+    let tag;
+    if (d.loitering) {
+      tag = `LOITERING ${d.dwellSeconds != null ? d.dwellSeconds + 's' : ''}`.trim();
+    } else if (d.label === 'plate') {
+      tag = d.name ? `PLATE ${d.name}` : 'PLATE';
+    } else if (d.label === 'vehicle') {
+      tag = d.vehicleType || 'vehicle';
+    } else if (d.name && d.personType && d.personType !== 'standard') {
+      tag = `${d.name} · ${d.personType}`;
+    } else {
+      tag = d.name || d.label;
+    }
     const label = `${tag} · ${Math.round(d.confidence * 100)}%`;
     drawLabel(ctx, x, y, label, color);
   }
@@ -899,10 +921,12 @@ function drawDonut(svgId, segments) {
 // ── Recent events (dashboard card) ───────────────────────
 const MAX_EVENTS = 5;
 const EVENT_TITLES = {
-  fire:   'Fire Detected',
-  smoke:  'Smoke Detected',
-  face:   'Face Detected',
-  person: 'Motion Detected',
+  fire:      'Fire Detected',
+  smoke:     'Smoke Detected',
+  face:      'Face Detected',
+  person:    'Motion Detected',
+  loitering: 'Loitering Detected',
+  plate:     'License Plate Read',
 };
 
 // Shared tile-layer config for every Leaflet map in the app. CartoDB's Dark
@@ -934,6 +958,8 @@ function eventIconHtml(type) {
   const symId = type === 'fire' || type === 'smoke' ? '#i-fire'
     : type === 'face' ? '#i-users'
     : type === 'person' ? '#i-running'
+    : type === 'loitering' ? '#i-running'
+    : type === 'plate' ? '#i-car'
     : '#i-bell';
   return `<span class="event-icon ${type}"><svg><use href="${symId}"/></svg></span>`;
 }
@@ -1237,11 +1263,14 @@ function readFilesAsDataURLs(fileList) {
 // ── Events / Alerts page ─────────────────────────────────
 function incidentTitle(row) {
   if (row.type === 'face' && row.name) return `Face Recognized`;
+  if (row.type === 'plate' && row.name) return `Plate: ${row.name}`;
   return EVENT_TITLES[row.type] || row.type;
 }
 function incidentIconSym(row) {
   if (row.type === 'fire' || row.type === 'smoke') return '#i-fire';
   if (row.type === 'face') return '#i-users';
+  if (row.type === 'loitering') return '#i-running';
+  if (row.type === 'plate') return '#i-car';
   return '#i-bell';
 }
 
@@ -2191,6 +2220,7 @@ const PAGES = {
   attendance:'page-attendance',
   maps:      'page-maps',
   settings:  'page-settings',
+  analyze:   'page-analyze',
   // Hidden routes (not in sidebar; entered via in-page actions).
   'person-activity': 'page-person-activity',
 };
@@ -2200,6 +2230,7 @@ const PAGES = {
 // flow into the dashboard's "Recent Events" card but not here.
 const isIncident = (row) =>
   !!row && (row.type === 'fire' || row.type === 'smoke' ||
+            row.type === 'loitering' || row.type === 'plate' ||
             (row.type === 'face' && !!row.name));
 
 function showRoute(route) {
@@ -2217,6 +2248,7 @@ function showRoute(route) {
   if (route === 'analytics') refreshAnalyticsCharts();
   if (route === 'attendance') refreshAttendance();
   if (route === 'maps')      refreshMapPage();
+  if (route === 'analyze')   window.analyzeModule?.wire();
   if (route === 'incidents') {
     refreshIncidentsTable();
     setBadge('bell-badge', 0);
@@ -2349,6 +2381,183 @@ document.querySelector('#enroll-form input[name="images"]')?.addEventListener('c
     list.appendChild(chip);
   }
 });
+
+// ── Analyze Video page ───────────────────────────────────
+// Offline pipeline: upload → backend spawns face-ai/analyze_video.py →
+// Socket.IO `analyze_progress` events flow back keyed by jobId → we render
+// a progress bar, then swap in the annotated MP4 for playback.
+window.analyzeModule = (() => {
+  const state = { jobId: null, file: null };
+
+  const $file      = () => document.getElementById('analyze-file');
+  const $drop      = () => document.getElementById('analyze-drop');
+  const $selected  = () => document.getElementById('analyze-selected');
+  const $submit    = () => document.getElementById('analyze-submit');
+  const $result    = () => document.getElementById('analyze-result');
+  const $placeholder = () => document.getElementById('analyze-placeholder');
+  const $progress  = () => document.getElementById('analyze-progress');
+  const $progFill  = () => document.getElementById('analyze-progress-fill');
+  const $progPct   = () => document.getElementById('analyze-progress-pct');
+  const $progFrames= () => document.getElementById('analyze-progress-frames');
+  const $progFps   = () => document.getElementById('analyze-progress-fps');
+  const $progEta   = () => document.getElementById('analyze-progress-eta');
+  const $error     = () => document.getElementById('analyze-error');
+  const $videoWrap = () => document.getElementById('analyze-video-wrap');
+  const $video     = () => document.getElementById('analyze-video');
+  const $download  = () => document.getElementById('analyze-download');
+
+  function selectFile(f) {
+    if (!f) return;
+    if (!f.type.startsWith('video/')) {
+      alert('Please choose a video file.');
+      return;
+    }
+    state.file = f;
+    const sel = $selected();
+    sel.style.display = 'flex';
+    sel.innerHTML = `<span><b>${f.name}</b></span><span>${fmtBytes(f.size)}</span>`;
+    $submit().disabled = false;
+  }
+
+  function reset() {
+    state.jobId = null;
+    state.file = null;
+    $file().value = '';
+    $selected().style.display = 'none';
+    $selected().innerHTML = '';
+    $submit().disabled = true;
+    $placeholder().style.display = '';
+    $progress().style.display = 'none';
+    $error().style.display = 'none';
+    $error().textContent = '';
+    $videoWrap().style.display = 'none';
+    const v = $video();
+    v.pause();
+    if (v.src && v.src.startsWith('blob:')) URL.revokeObjectURL(v.src);
+    v.src = '';
+    $progFill().style.width = '0%';
+  }
+
+  async function submit() {
+    if (!state.file) return;
+    const btn = $submit();
+    btn.disabled = true;
+    btn.textContent = 'Uploading…';
+    $placeholder().style.display = 'none';
+    $progress().style.display = '';
+    $error().style.display = 'none';
+    $videoWrap().style.display = 'none';
+    $progFill().style.width = '0%';
+    $progPct().textContent = '0%';
+    $progFrames().textContent = 'frame 0 / 0';
+    $progFps().textContent = '— fps';
+    $progEta().textContent = 'ETA —';
+
+    const fd = new FormData();
+    fd.append('video', state.file);
+    fd.append('loiteringSeconds', document.getElementById('analyze-loitering').value || '10');
+    fd.append('downscale', document.getElementById('analyze-downscale').value || '0.5');
+    fd.append('useEnrollment', document.getElementById('analyze-enrollment').checked ? 'true' : 'false');
+    fd.append('detectFire',    document.getElementById('analyze-fire').checked ? 'true' : 'false');
+    fd.append('personSensitivity', document.getElementById('analyze-person-sensitivity').value || 'balanced');
+
+    try {
+      const resp = await fetch(`${API}/analyze-video`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }, // multer needs no Content-Type override
+        body: fd,
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: 'upload failed' }));
+        throw new Error(err.error || `HTTP ${resp.status}`);
+      }
+      const { jobId } = await resp.json();
+      state.jobId = jobId;
+      btn.textContent = 'Analyzing…';
+    } catch (e) {
+      showError(e.message || 'Upload failed');
+      btn.textContent = 'Analyze';
+      btn.disabled = false;
+    }
+  }
+
+  function showError(msg) {
+    $progress().style.display = 'none';
+    const el = $error();
+    el.textContent = msg;
+    el.style.display = '';
+    $submit().textContent = 'Analyze';
+    $submit().disabled = !state.file;
+  }
+
+  function onProgress(msg) {
+    if (!msg || msg.jobId !== state.jobId) return;
+    if (msg.status === 'running') {
+      if (msg.phase === 'encoding') {
+        // Frame loop finished; ffmpeg re-encode is running (can be a minute+
+        // on 4K CPU). Keep the bar full and swap labels so it doesn't look frozen.
+        $progFill().style.width = '100%';
+        $progPct().textContent = 'Finalizing…';
+        $progFrames().textContent = 'Re-encoding to H.264';
+        $progFps().textContent = '';
+        $progEta().textContent = '';
+        return;
+      }
+      const pct = Math.max(0, Math.min(1, msg.progress || 0));
+      $progFill().style.width = `${(pct * 100).toFixed(1)}%`;
+      $progPct().textContent = `${(pct * 100).toFixed(1)}%`;
+      $progFrames().textContent = `frame ${msg.frame} / ${msg.totalFrames}`;
+      $progFps().textContent = msg.fps != null ? `${msg.fps.toFixed(2)} fps` : '— fps';
+      $progEta().textContent = msg.etaSeconds != null && msg.etaSeconds > 0
+        ? `ETA ${Math.round(msg.etaSeconds)}s` : 'ETA —';
+    } else if (msg.status === 'done') {
+      $progFill().style.width = '100%';
+      $progPct().textContent = '100%';
+      finish(msg.outputUrl);
+    } else if (msg.status === 'error') {
+      showError(msg.error || 'Analyzer failed');
+    }
+  }
+
+  function finish(outputUrl) {
+    // Point <video> straight at the backend URL with the JWT as a query param
+    // — the backend supports Range requests, so the browser streams chunks and
+    // seeks natively instead of us slurping the whole file as a blob (which
+    // aborts on large files and can't do preflighted-CORS with the Auth header).
+    const url = `${API}${outputUrl}?token=${encodeURIComponent(token)}`;
+    $progress().style.display = 'none';
+    $videoWrap().style.display = '';
+    const v = $video();
+    v.src = url;
+    v.load();
+    $download().href = url;
+    $download().download = 'annotated.mp4';
+    $submit().textContent = 'Analyze';
+    $submit().disabled = !state.file;
+  }
+
+  // Wire event handlers once — the page may be revisited many times but the
+  // DOM elements are static, so single listeners are enough.
+  function wire() {
+    const drop = $drop();
+    if (!drop || drop.dataset.wired) return;
+    drop.dataset.wired = '1';
+    drop.addEventListener('click', () => $file().click());
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('drag-over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+    drop.addEventListener('drop', (e) => {
+      e.preventDefault();
+      drop.classList.remove('drag-over');
+      const f = e.dataTransfer.files?.[0];
+      if (f) selectFile(f);
+    });
+    $file().addEventListener('change', (e) => selectFile(e.target.files?.[0]));
+    $submit().addEventListener('click', submit);
+    document.getElementById('analyze-new').addEventListener('click', reset);
+  }
+
+  return { wire, reset, onProgress };
+})();
 
 // ── Top bar wiring ───────────────────────────────────────
 const userMenuBtn = document.getElementById('user-menu-btn');

@@ -102,6 +102,7 @@
       <nav class="nav">
         <a class="nav-item active" data-route="dashboard"><svg><use href="#i-grid"/></svg>Dashboard</a>
         <a class="nav-item disabled" data-route="playback"><svg><use href="#i-play"/></svg>Playback<span class="soon">Soon</span></a>
+        <a class="nav-item"        data-route="analyze"><svg><use href="#i-eye"/></svg>Analyze Video</a>
         <a class="nav-item"        data-route="incidents"><svg><use href="#i-alert"/></svg>Incidents<span class="nav-badge" id="nav-incidents-badge">0</span></a>
         <a class="nav-item"        data-route="cameras"><svg><use href="#i-camera"/></svg>Cameras</a>
         <a class="nav-item"        data-route="maps"><svg><use href="#i-map"/></svg>Maps</a>
@@ -548,6 +549,87 @@
           <span class="placeholder-icon"><svg><use href="#i-map"/></svg></span>
           <h2>No mapped cameras yet</h2>
           <p>Add a camera with latitude/longitude to see it here.</p>
+        </div>
+      </section>
+
+      <!-- Analyze Video (offline pipeline) -->
+      <section class="page" id="page-analyze" style="display:none">
+        <div class="page-header">
+          <div>
+            <div class="page-title">Analyze Video</div>
+            <div class="page-sub">Upload a recorded clip and run the full detection pipeline offline — persons, faces, loitering, vehicles, Bangla license plates, and fire/smoke — then play back the annotated video.</div>
+          </div>
+        </div>
+
+        <div class="analyze-wrap">
+          <div class="analyze-form card">
+            <header class="card-head"><h2>New Job</h2></header>
+            <div class="analyze-drop" id="analyze-drop">
+              <svg><use href="#i-arrow-up"/></svg>
+              <div class="analyze-drop-title">Drop a video here, or click to pick</div>
+              <div class="analyze-drop-hint">Supported: mp4, mov, mkv, avi, webm · up to 2 GB</div>
+              <input type="file" id="analyze-file" accept="video/*" style="display:none">
+            </div>
+            <div class="analyze-selected" id="analyze-selected" style="display:none"></div>
+
+            <div class="analyze-opts">
+              <label>
+                <span>Loitering threshold (s)</span>
+                <input type="number" id="analyze-loitering" min="1" max="600" value="10">
+              </label>
+              <label>
+                <span>Detection scale</span>
+                <select id="analyze-downscale">
+                  <option value="0.4">0.4× (fastest)</option>
+                  <option value="0.5" selected>0.5× (default)</option>
+                  <option value="0.75">0.75×</option>
+                  <option value="1">1.0× (slowest, most accurate)</option>
+                </select>
+              </label>
+              <label>
+                <span>Person sensitivity</span>
+                <select id="analyze-person-sensitivity">
+                  <option value="high">High recall (catches small/distant figures)</option>
+                  <option value="balanced" selected>Balanced (default)</option>
+                  <option value="strict">Strict (near-camera CCTV only)</option>
+                </select>
+              </label>
+              <label class="analyze-checkbox">
+                <input type="checkbox" id="analyze-enrollment" checked>
+                <span>Use my enrolled faces for name recognition</span>
+              </label>
+              <label class="analyze-checkbox">
+                <input type="checkbox" id="analyze-fire">
+                <span>Detect fire / smoke (off by default — noisy on daytime footage)</span>
+              </label>
+            </div>
+
+            <button class="btn-primary" id="analyze-submit" disabled>Analyze</button>
+          </div>
+
+          <div class="analyze-result card" id="analyze-result">
+            <header class="card-head"><h2 id="analyze-result-title">Result</h2></header>
+            <div class="analyze-placeholder" id="analyze-placeholder">
+              Upload a video to get started. Progress and playback will appear here.
+            </div>
+            <div class="analyze-progress" id="analyze-progress" style="display:none">
+              <div class="analyze-progress-bar"><div class="analyze-progress-fill" id="analyze-progress-fill"></div></div>
+              <div class="analyze-progress-meta">
+                <span id="analyze-progress-pct">0%</span>
+                <span id="analyze-progress-frames">frame 0 / 0</span>
+                <span id="analyze-progress-fps">— fps</span>
+                <span id="analyze-progress-eta">ETA —</span>
+              </div>
+            </div>
+            <div class="analyze-error" id="analyze-error" style="display:none"></div>
+            <div class="analyze-video-wrap" id="analyze-video-wrap" style="display:none">
+              <video id="analyze-video" controls playsinline></video>
+              <div class="analyze-video-actions">
+                <a class="btn-secondary" id="analyze-download" download>Download</a>
+                <button class="btn-secondary" id="analyze-new">Analyze another</button>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 

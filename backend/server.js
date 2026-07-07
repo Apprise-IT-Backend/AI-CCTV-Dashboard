@@ -8,6 +8,7 @@ const { spawn } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const multer = require('multer');
 
 const db = require('./db');
 const auth = require('./auth');
@@ -20,6 +21,13 @@ const PYTHON = process.env.PYTHON || 'python';
 const DETECTOR = path.join(__dirname, '..', 'face-ai', 'detect.py');
 const ENROLLMENT_ROOT = path.join(__dirname, '..', 'face-ai', 'enrollments');
 const AGENT_SCRIPT = path.join(__dirname, '..', 'agent', 'agent.py');
+const ANALYZER = path.join(__dirname, '..', 'face-ai', 'analyze_video.py');
+
+// Offline video analyzer — uploads + annotated outputs live here.
+// Files are per-user under an `<userId>` folder so the download route can do
+// a strict ownership check by prefix without touching a DB table.
+const ANALYZE_ROOT = path.join(__dirname, '..', 'face-ai', 'analyze_jobs');
+fs.mkdirSync(ANALYZE_ROOT, { recursive: true });
 
 fs.mkdirSync(ENROLLMENT_ROOT, { recursive: true });
 
@@ -114,10 +122,26 @@ async function persistIncidents(streamId, detections, incidents, snapshotPath) {
     }
   }
 
-  if (Array.isArray(incidents) && isEnabled('fire_detection')) {
+  if (Array.isArray(incidents)) {
     for (const inc of incidents) {
-      if (inc.type === 'fire' || inc.type === 'smoke') {
+      if ((inc.type === 'fire' || inc.type === 'smoke') && isEnabled('fire_detection')) {
         candidates.push({ type: inc.type, name: null, confidence: inc.confidence, bbox: inc.box });
+      } else if (inc.type === 'loitering' && isEnabled('loitering_detection')) {
+        // Track ID goes into `name` so the incidents rail can group per-person.
+        // Include dwellSeconds inside the bbox JSON blob for later inspection.
+        const bbox = { box: inc.box, dwellSeconds: inc.dwellSeconds, trackId: inc.trackId };
+        candidates.push({
+          type: 'loitering', name: inc.trackId != null ? `Track #${inc.trackId}` : null,
+          confidence: inc.confidence, bbox,
+        });
+      } else if (inc.type === 'plate' && isEnabled('plate_detection')) {
+        // The plate string itself is the incident's `name` — surfaces on the
+        // Incidents page in the Name column so a user can search their history.
+        const bbox = { box: inc.box, trackId: inc.trackId, vehicleType: inc.vehicleType };
+        candidates.push({
+          type: 'plate', name: inc.plate || null,
+          confidence: inc.confidence, bbox,
+        });
       }
     }
   }
@@ -233,6 +257,245 @@ app.use(auth.httpAuth);
 
 app.get('/me', (req, res) => {
   res.json({ id: req.user.uid, username: req.user.username });
+});
+
+// ── Offline video analyzer ────────────────────────────────────
+// One-shot pipeline that runs `face-ai/analyze_video.py` on an uploaded video
+// and produces an annotated MP4. Progress is streamed to the user's Socket.IO
+// room as `analyze_progress` events keyed by jobId.
+//
+// Flow:
+//   POST /analyze-video     multipart form with `video` file → { jobId }
+//   GET  /analyze-video/:id status/metadata JSON
+//   GET  /analyze-video/:id/output   streams the annotated MP4 when ready
+//   DELETE /analyze-video/:id        removes input + output from disk
+const analyzeJobs = new Map(); // jobId -> { userId, status, progress, inputPath, outputPath, error, proc }
+
+const analyzeUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const userDir = path.join(ANALYZE_ROOT, String(req.user.uid));
+      fs.mkdirSync(userDir, { recursive: true });
+      cb(null, userDir);
+    },
+    filename: (req, file, cb) => {
+      // Keep the original extension so ffmpeg/opencv can dispatch the right demuxer.
+      const jobId = uuidv4();
+      req._analyzeJobId = jobId;
+      const ext = (path.extname(file.originalname || '') || '.mp4').toLowerCase();
+      cb(null, `${jobId}_in${ext}`);
+    },
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB, generous for testing
+  fileFilter: (req, file, cb) => {
+    // Multer inspects the client-provided MIME + extension. OpenCV can open
+    // most containers so we're lenient; only rejecting the truly obvious mistakes.
+    const okExt = /\.(mp4|mov|mkv|avi|webm|m4v|mpg|mpeg)$/i.test(file.originalname || '');
+    const okMime = /^video\//.test(file.mimetype || '');
+    if (okExt || okMime) return cb(null, true);
+    cb(new Error('Only video files are accepted'));
+  },
+});
+
+app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'video file required (field name "video")' });
+  const jobId = req._analyzeJobId;
+  const userId = req.user.uid;
+  const inputPath = req.file.path;
+  const outputPath = path.join(path.dirname(inputPath), `${jobId}_out.mp4`);
+
+  // Options the client can pass alongside the file. All optional.
+  //   loiteringSeconds: dwell time override
+  //   downscale: 0..1 processing scale
+  //   useEnrollment: 'true' → run face recognition against the user's enrolled faces
+  const opts = req.body || {};
+  const loiteringSeconds = Math.max(1, Math.min(600, Number(opts.loiteringSeconds) || 30));
+  const downscale = Math.max(0.2, Math.min(1.0, Number(opts.downscale) || 0.5));
+  const useEnrollment = String(opts.useEnrollment || 'true') === 'true';
+  // Fire detection is off by default in the offline analyzer — the HSV
+  // heuristic false-positives on brake lights and daytime warm surfaces,
+  // which is the exact kind of footage users tend to upload for testing.
+  const detectFire = String(opts.detectFire || 'false') === 'true';
+  // Person sensitivity presets — expose a curated dropdown rather than raw numbers.
+  const PERSON_PRESETS = {
+    high:     { conf: 0.30, minArea: 0.002 },
+    balanced: { conf: 0.40, minArea: 0.005 },  // default — tuned for wide street shots
+    strict:   { conf: 0.60, minArea: 0.05  },  // near-camera CCTV (original detect.py values)
+  };
+  const preset = PERSON_PRESETS[opts.personSensitivity] || PERSON_PRESETS.balanced;
+
+  const args = [
+    '-u', ANALYZER, inputPath,
+    '-o', outputPath,
+    '--downscale', String(downscale),
+    '--loitering-seconds', String(loiteringSeconds),
+    '--person-conf', String(preset.conf),
+    '--person-min-area', String(preset.minArea),
+    '--progress-json',
+  ];
+  if (!detectFire) args.push('--no-fire');
+  if (useEnrollment) {
+    args.push('--enrollment-dir', db.userEnrollmentDir(userId));
+  }
+
+  const job = {
+    userId, status: 'running', progress: 0, frame: 0, totalFrames: 0,
+    fps: 0, etaSeconds: null, error: null,
+    inputPath, outputPath, originalName: req.file.originalname || 'video',
+    startedAt: Date.now(), finishedAt: null, proc: null,
+    lastEmitAt: 0,
+  };
+  analyzeJobs.set(jobId, job);
+  res.status(202).json({ jobId });
+
+  console.log(`[analyze] job ${jobId} user ${userId} — ${req.file.originalname} (${req.file.size} bytes)`);
+
+  // Spawn the analyzer. Same Python interpreter as detect.py.
+  const proc = spawn(PYTHON, args, {
+    cwd: path.dirname(ANALYZER),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  job.proc = proc;
+
+  let buf = '';
+  proc.stdout.on('data', (chunk) => {
+    buf += chunk.toString();
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      // Progress JSON lines look like: {"type":"progress","frame":N,"total":M,"fps":X,"eta":Y}
+      // Anything else is human-readable and printed to the console.
+      if (line.startsWith('{')) {
+        try {
+          const msg = JSON.parse(line);
+          if (msg.type === 'progress') {
+            job.frame = msg.frame; job.totalFrames = msg.total;
+            job.progress = msg.total ? msg.frame / msg.total : 0;
+            job.fps = msg.fps; job.etaSeconds = msg.eta;
+            // Throttle wire chatter — a 4 FPS analyzer would otherwise flood the socket.
+            const now = Date.now();
+            if (now - job.lastEmitAt >= 250 || msg.frame === msg.total) {
+              job.lastEmitAt = now;
+              emitToUser(userId, 'analyze_progress', {
+                jobId, status: 'running', frame: job.frame, totalFrames: job.totalFrames,
+                progress: job.progress, fps: job.fps, etaSeconds: job.etaSeconds,
+              });
+            }
+            continue;
+          }
+          if (msg.type === 'phase') {
+            // Post-detection stages (ffmpeg re-encode) — bar stays at 100% but
+            // we swap the label so the UI doesn't look frozen.
+            job.phase = msg.name;
+            emitToUser(userId, 'analyze_progress', {
+              jobId, status: 'running', phase: msg.name,
+              progress: job.progress || 1,
+              frame: job.frame, totalFrames: job.totalFrames,
+            });
+            continue;
+          }
+        } catch { /* fall through to raw log */ }
+      }
+      console.log(`[analyze:${jobId.slice(0,8)}] ${line}`);
+    }
+  });
+
+  proc.stderr.on('data', (d) => {
+    const txt = d.toString().trim();
+    if (txt) console.error(`[analyze:${jobId.slice(0,8)}] ${txt}`);
+  });
+
+  proc.on('exit', (code) => {
+    job.finishedAt = Date.now();
+    job.proc = null;
+    if (code === 0 && fs.existsSync(outputPath)) {
+      job.status = 'done'; job.progress = 1;
+      emitToUser(userId, 'analyze_progress', {
+        jobId, status: 'done', progress: 1,
+        outputUrl: `/analyze-video/${jobId}/output`,
+      });
+      console.log(`[analyze] job ${jobId} done — ${outputPath}`);
+    } else {
+      job.status = 'error';
+      job.error = code === 0 ? 'analyzer produced no output' : `analyzer exited ${code}`;
+      emitToUser(userId, 'analyze_progress', {
+        jobId, status: 'error', error: job.error,
+      });
+      console.error(`[analyze] job ${jobId} failed (${job.error})`);
+    }
+  });
+});
+
+app.get('/analyze-video/:id', (req, res) => {
+  const job = analyzeJobs.get(req.params.id);
+  if (!job || job.userId !== req.user.uid) return res.status(404).json({ error: 'not found' });
+  const { proc, ...safe } = job; // don't leak the process handle
+  res.json({
+    jobId: req.params.id,
+    ...safe,
+    outputUrl: job.status === 'done' ? `/analyze-video/${req.params.id}/output` : null,
+  });
+});
+
+app.get('/analyze-video/:id/output', (req, res) => {
+  const job = analyzeJobs.get(req.params.id);
+  if (!job || job.userId !== req.user.uid) return res.status(404).json({ error: 'not found' });
+  if (job.status !== 'done') return res.status(409).json({ error: 'not ready' });
+  // Constrain path to ANALYZE_ROOT so a spoofed jobId can't traverse.
+  const abs = path.resolve(job.outputPath);
+  if (!abs.startsWith(path.resolve(ANALYZE_ROOT))) return res.status(403).json({ error: 'forbidden' });
+  const stat = (() => { try { return fs.statSync(abs); } catch { return null; } })();
+  if (!stat) return res.status(410).json({ error: 'output missing' });
+
+  const size = stat.size;
+  const range = req.headers.range;
+  // Range support is what lets <video> stream + seek without slurping the whole
+  // file. Chrome in particular refuses to play videos > ~100 MB delivered as
+  // one big blob without Range, and reports "Failed to fetch" for the client
+  // fetch() variant. Standard `bytes=start-end` (or `bytes=start-`) suffix.
+  const commonHeaders = {
+    'Content-Type': 'video/mp4',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+  };
+
+  if (range) {
+    const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+    if (!m) return res.status(416).set('Content-Range', `bytes */${size}`).end();
+    const start = parseInt(m[1], 10);
+    const end = m[2] ? Math.min(parseInt(m[2], 10), size - 1) : size - 1;
+    if (start >= size || end < start) {
+      return res.status(416).set('Content-Range', `bytes */${size}`).end();
+    }
+    res.writeHead(206, {
+      ...commonHeaders,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Content-Length': end - start + 1,
+    });
+    const stream = fs.createReadStream(abs, { start, end });
+    stream.on('error', (err) => { console.error('[analyze] stream err:', err.message); res.destroy(); });
+    stream.pipe(res);
+    return;
+  }
+
+  // Full-file response.
+  res.writeHead(200, { ...commonHeaders, 'Content-Length': size });
+  const stream = fs.createReadStream(abs);
+  stream.on('error', (err) => { console.error('[analyze] stream err:', err.message); res.destroy(); });
+  stream.pipe(res);
+});
+
+app.delete('/analyze-video/:id', (req, res) => {
+  const job = analyzeJobs.get(req.params.id);
+  if (!job || job.userId !== req.user.uid) return res.status(404).json({ error: 'not found' });
+  if (job.proc) try { job.proc.kill(); } catch {}
+  for (const p of [job.inputPath, job.outputPath]) {
+    try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  }
+  analyzeJobs.delete(req.params.id);
+  res.json({ ok: true });
 });
 
 // ── Camera helpers ────────────────────────────────────────────

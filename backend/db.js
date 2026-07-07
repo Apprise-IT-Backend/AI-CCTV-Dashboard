@@ -3,18 +3,20 @@ const fs = require('fs');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 
-const DB_HOST = process.env.DB_HOST || '127.0.0.1';
+const DB_HOST = process.env.DB_HOST || '157.245.207.91';
 const DB_PORT = Number(process.env.DB_PORT || 3306);
-const DB_USER = process.env.DB_USER || 'root';
-const DB_PASS = process.env.DB_PASS || '';
+const DB_USER = process.env.DB_USER || 'admin_user';
+const DB_PASS = process.env.DB_PASS || 'Admin@Secure123!';
 const DB_NAME = process.env.DB_NAME || 'ai_cctv';
 
 const ENROLLMENT_ROOT = path.join(__dirname, '..', 'face-ai', 'enrollments');
 
 const DEFAULT_FEATURES = [
-  { name: 'fire_detection',   enabled: 1, description: 'Log fire/smoke incidents detected by the AI worker' },
-  { name: 'face_detection',   enabled: 1, description: 'Log recognized face matches as incidents' },
+  { name: 'fire_detection', enabled: 1, description: 'Log fire/smoke incidents detected by the AI worker' },
+  { name: 'face_detection', enabled: 1, description: 'Log recognized face matches as incidents' },
   { name: 'person_detection', enabled: 0, description: 'Log person presence (high volume — off by default)' },
+  { name: 'loitering_detection', enabled: 1, description: 'Log persons that dwell in-frame beyond LOITERING_SECONDS (default 30s)' },
+  { name: 'plate_detection', enabled: 1, description: 'Log recognized Bangla / English license plates from vehicles in view' },
 ];
 
 let pool;
@@ -119,6 +121,21 @@ async function init() {
 
   await seedAdmin();
   await migrateLegacyEnrollments();
+  await backfillFeaturesForAllUsers();
+}
+
+// Seed every default feature row (see DEFAULT_FEATURES) for every existing user.
+// Idempotent — the INSERT uses ON DUPLICATE KEY UPDATE, so users who already
+// have a row for the feature just get their description refreshed. Runs on every
+// backend boot so newly-added default features roll out to existing accounts
+// without a manual migration step.
+async function backfillFeaturesForAllUsers() {
+  const [users] = await pool.query('SELECT id FROM users');
+  if (!users.length) return;
+  for (const u of users) {
+    await seedFeaturesFor(u.id);
+  }
+  console.log(`[DB] Backfilled default features for ${users.length} user(s)`);
 }
 
 async function ensureColumn(table, column, definition) {
