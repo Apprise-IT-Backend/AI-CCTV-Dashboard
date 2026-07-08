@@ -2573,12 +2573,24 @@ window.analyzeModule = (() => {
     v.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
+  // Per-event visual metadata — must match the box colors burned into the video.
+  const EVENT_META = {
+    face:      { label: 'Face Recognized',  cls: 'ev-face' },
+    plate:     { label: 'Plate Read',       cls: 'ev-plate' },
+    loitering: { label: 'Loitering',        cls: 'ev-loit' },
+    fire:      { label: 'Fire / Smoke',     cls: 'ev-fire' },
+  };
+
   function buildIncidentRow(item) {
-    // Table row modelled on the Incidents page: thumbnail, title/subtitle,
-    // timestamp button (click → seek), lightbox on thumbnail click.
+    // Single unified row: Snapshot | Event badge | Subject | Detail | Time.
+    // Modelled on the Incidents page — the event badge is what tells the user
+    // at a glance which detector fired (loitering vs face vs plate vs fire),
+    // without them having to read the section header.
+    const meta = EVENT_META[item.event] || { label: item.event, cls: '' };
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="analyze-row-thumb"></td>
+      <td class="analyze-row-event"></td>
       <td class="analyze-row-title"></td>
       <td class="analyze-row-sub"></td>
       <td class="analyze-row-time"></td>
@@ -2589,11 +2601,15 @@ window.analyzeModule = (() => {
       img.alt = item.title;
       img.loading = 'lazy';
       img.className = 'analyze-row-img';
-      img.addEventListener('click', () => openSnapshotLightbox(img.src, `${item.title} — ${item.subtitle || ''}`));
+      img.addEventListener('click', () => openSnapshotLightbox(img.src, `${meta.label}: ${item.title}`));
       tr.querySelector('.analyze-row-thumb').appendChild(img);
     } else {
       tr.querySelector('.analyze-row-thumb').textContent = '—';
     }
+    const badge = document.createElement('span');
+    badge.className = `analyze-event-badge ${meta.cls}`;
+    badge.textContent = meta.label;
+    tr.querySelector('.analyze-row-event').appendChild(badge);
     tr.querySelector('.analyze-row-title').textContent = item.title;
     tr.querySelector('.analyze-row-sub').textContent = item.subtitle || '';
     const timeBtn = document.createElement('button');
@@ -2634,15 +2650,44 @@ window.analyzeModule = (() => {
       countsEl.appendChild(el);
     }
 
-    function fillSection(id, title, items) {
-      const el = document.getElementById(id);
-      if (!items || !items.length) return;
-      el.innerHTML = `
-        <div class="analyze-summary-title"></div>
+    // Flatten all four event types into a single chronologically-sorted list
+    // so the reader sees "what happened, and when" in reading order — same
+    // pattern as the Incidents page. The `event` tag drives the coloured
+    // badge in each row.
+    const rows = [];
+    for (const f of summary.faces || []) rows.push({
+      event: 'face', snap: f.snap, title: f.name,
+      subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
+      first_s: f.first_s,
+    });
+    for (const p of summary.plates || []) rows.push({
+      event: 'plate', snap: p.snap, title: p.plate,
+      subtitle: p.vehicleType || 'vehicle',
+      first_s: p.first_s,
+    });
+    for (const l of summary.loitering || []) rows.push({
+      event: 'loitering', snap: l.snap, title: `Track #${l.trackId}`,
+      subtitle: `Peak dwell ${l.peak_dwell_s}s`,
+      first_s: l.first_s,
+    });
+    for (let i = 0; i < (summary.fire || []).length; i++) {
+      const f = summary.fire[i];
+      rows.push({
+        event: 'fire', snap: f.snap, title: `Event ${i + 1}`,
+        subtitle: '', first_s: f.first_s,
+      });
+    }
+    rows.sort((a, b) => (a.first_s || 0) - (b.first_s || 0));
+
+    const eventsSection = document.getElementById('analyze-summary-events');
+    if (rows.length) {
+      eventsSection.innerHTML = `
+        <div class="analyze-summary-title">Detected Events</div>
         <table class="analyze-summary-table">
           <thead>
             <tr>
               <th>Snapshot</th>
+              <th>Event</th>
               <th>Subject</th>
               <th>Detail</th>
               <th>Time</th>
@@ -2651,38 +2696,9 @@ window.analyzeModule = (() => {
           <tbody></tbody>
         </table>
       `;
-      el.querySelector('.analyze-summary-title').textContent = title;
-      const tbody = el.querySelector('tbody');
-      for (const it of items) tbody.appendChild(buildIncidentRow(it));
+      const tbody = eventsSection.querySelector('tbody');
+      for (const r of rows) tbody.appendChild(buildIncidentRow(r));
     }
-
-    fillSection('analyze-summary-faces', 'Recognized faces',
-      (summary.faces || []).map(f => ({
-        snap: f.snap, title: f.name,
-        subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
-        first_s: f.first_s,
-      })));
-
-    fillSection('analyze-summary-plates', 'License plates',
-      (summary.plates || []).map(p => ({
-        snap: p.snap, title: p.plate,
-        subtitle: p.vehicleType || 'vehicle',
-        first_s: p.first_s,
-      })));
-
-    fillSection('analyze-summary-loitering', 'Loitering incidents',
-      (summary.loitering || []).map(l => ({
-        snap: l.snap, title: `Track #${l.trackId}`,
-        subtitle: `Peak dwell ${l.peak_dwell_s}s`,
-        first_s: l.first_s,
-      })));
-
-    fillSection('analyze-summary-fire', 'Fire / smoke incidents',
-      (summary.fire || []).map((f, i) => ({
-        snap: f.snap, title: `Fire event ${i + 1}`,
-        subtitle: '',
-        first_s: f.first_s,
-      })));
   }
 
   // Wire event handlers once — the page may be revisited many times but the

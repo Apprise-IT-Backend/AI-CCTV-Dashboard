@@ -1884,9 +1884,31 @@ input:focus {
   border: 1px solid var(--border); transition: border-color .15s;
 }
 .analyze-row-img:hover { border-color: var(--accent); }
+.analyze-row-event { width: 140px; min-width: 140px; }
 .analyze-row-title { font-weight: 600; }
 .analyze-row-sub { color: var(--text-secondary); }
 .analyze-row-time { text-align: right; width: 90px; }
+
+/* Event-type badges — colours match the box colours burned into the video */
+.analyze-event-badge {
+  display: inline-flex; align-items: center;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.analyze-event-badge.ev-face  {
+  background: rgba(16,185,129, 0.15); color: #10b981; border-color: rgba(16,185,129, 0.4);
+}
+.analyze-event-badge.ev-plate {
+  background: rgba(34,211,238, 0.15); color: #22d3ee; border-color: rgba(34,211,238, 0.4);
+}
+.analyze-event-badge.ev-loit  {
+  background: rgba(251,146,60, 0.15); color: #fb923c; border-color: rgba(251,146,60, 0.4);
+}
+.analyze-event-badge.ev-fire  {
+  background: rgba(239,68,68, 0.15);  color: #ef4444; border-color: rgba(239,68,68, 0.4);
+}
 .analyze-time-btn {
   background: transparent; border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 10px; cursor: pointer;
