@@ -2534,7 +2534,12 @@ window.analyzeModule = (() => {
     const v = $video();
     v.src = url;
     v.load();
-    $download().href = url;
+    // The Download button needs a separate URL that forces attachment
+    // behaviour: the plain <a download> attribute is ignored cross-origin,
+    // so we ask the backend to send Content-Disposition: attachment via
+    // `?download=1`. The video player uses the plain URL so streaming +
+    // Range requests still work.
+    $download().href = url + '&download=1';
     $download().download = 'annotated.mp4';
     $submit().textContent = 'Analyze';
     $submit().disabled = !state.file;

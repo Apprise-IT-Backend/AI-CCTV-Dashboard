@@ -474,6 +474,18 @@ app.get('/analyze-video/:id/output', (req, res) => {
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
   };
+  // `?download=1` forces a browser download instead of inline playback. The
+  // <a download> attribute alone won't work here because frontend and backend
+  // are cross-origin; only a Content-Disposition: attachment header will.
+  if (req.query.download === '1') {
+    const stem = (job.originalName || 'video').replace(/\.[^.]+$/, '');
+    // Quote-escape the ASCII fallback and provide a UTF-8 one via filename*
+    // so Bangla / other non-ASCII filenames survive intact.
+    const safe = stem.replace(/[^A-Za-z0-9._-]+/g, '_') || 'video';
+    const utf8 = encodeURIComponent(`${stem}_annotated.mp4`);
+    commonHeaders['Content-Disposition'] =
+      `attachment; filename="${safe}_annotated.mp4"; filename*=UTF-8''${utf8}`;
+  }
 
   if (range) {
     const m = /^bytes=(\d+)-(\d*)$/.exec(range);
