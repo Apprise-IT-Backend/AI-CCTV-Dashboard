@@ -2436,6 +2436,8 @@ window.analyzeModule = (() => {
     if (v.src && v.src.startsWith('blob:')) URL.revokeObjectURL(v.src);
     v.src = '';
     $progFill().style.width = '0%';
+    const summaryEl = document.getElementById('analyze-summary');
+    if (summaryEl) { summaryEl.style.display = 'none'; summaryEl.querySelectorAll(':scope > div').forEach(d => d.innerHTML = ''); }
   }
 
   async function submit() {
@@ -2447,6 +2449,8 @@ window.analyzeModule = (() => {
     $progress().style.display = '';
     $error().style.display = 'none';
     $videoWrap().style.display = 'none';
+    const summaryEl0 = document.getElementById('analyze-summary');
+    if (summaryEl0) summaryEl0.style.display = 'none';
     $progFill().style.width = '0%';
     $progPct().textContent = '0%';
     $progFrames().textContent = 'frame 0 / 0';
@@ -2513,13 +2517,13 @@ window.analyzeModule = (() => {
     } else if (msg.status === 'done') {
       $progFill().style.width = '100%';
       $progPct().textContent = '100%';
-      finish(msg.outputUrl);
+      finish(msg.outputUrl, msg.summary);
     } else if (msg.status === 'error') {
       showError(msg.error || 'Analyzer failed');
     }
   }
 
-  function finish(outputUrl) {
+  function finish(outputUrl, summary) {
     // Point <video> straight at the backend URL with the JWT as a query param
     // — the backend supports Range requests, so the browser streams chunks and
     // seeks natively instead of us slurping the whole file as a blob (which
@@ -2534,6 +2538,146 @@ window.analyzeModule = (() => {
     $download().download = 'annotated.mp4';
     $submit().textContent = 'Analyze';
     $submit().disabled = !state.file;
+    renderSummary(summary);
+  }
+
+  function snapUrl(fname) {
+    if (!fname || !state.jobId) return null;
+    return `${API}/analyze-video/${state.jobId}/snapshot/${encodeURIComponent(fname)}?token=${encodeURIComponent(token)}`;
+  }
+
+  function fmtSecondsClock(s) {
+    // "0:42", "1:03:45" — MM:SS or HH:MM:SS as appropriate.
+    if (s == null) return '';
+    const total = Math.max(0, Math.round(s));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const ss = total % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`;
+  }
+
+  function seekVideoTo(seconds) {
+    // Move the player head to the given moment in the annotated clip.
+    // Clamps to [0, duration] because Chrome throws on out-of-range set.
+    const v = $video();
+    if (!v || !isFinite(seconds)) return;
+    const dur = isFinite(v.duration) ? v.duration : Infinity;
+    v.currentTime = Math.max(0, Math.min(dur, seconds));
+    v.play?.().catch(() => { /* autoplay may be blocked; user can click play */ });
+    v.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function buildIncidentRow(item) {
+    // Table row modelled on the Incidents page: thumbnail, title/subtitle,
+    // timestamp button (click → seek), lightbox on thumbnail click.
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="analyze-row-thumb"></td>
+      <td class="analyze-row-title"></td>
+      <td class="analyze-row-sub"></td>
+      <td class="analyze-row-time"></td>
+    `;
+    if (item.snap) {
+      const img = document.createElement('img');
+      img.src = snapUrl(item.snap);
+      img.alt = item.title;
+      img.loading = 'lazy';
+      img.className = 'analyze-row-img';
+      img.addEventListener('click', () => openSnapshotLightbox(img.src, `${item.title} — ${item.subtitle || ''}`));
+      tr.querySelector('.analyze-row-thumb').appendChild(img);
+    } else {
+      tr.querySelector('.analyze-row-thumb').textContent = '—';
+    }
+    tr.querySelector('.analyze-row-title').textContent = item.title;
+    tr.querySelector('.analyze-row-sub').textContent = item.subtitle || '';
+    const timeBtn = document.createElement('button');
+    timeBtn.className = 'analyze-time-btn';
+    timeBtn.textContent = fmtSecondsClock(item.first_s);
+    timeBtn.title = 'Jump to this moment in the video';
+    timeBtn.addEventListener('click', () => seekVideoTo(item.first_s));
+    tr.querySelector('.analyze-row-time').appendChild(timeBtn);
+    return tr;
+  }
+
+  function renderSummary(summary) {
+    const root = document.getElementById('analyze-summary');
+    if (!root) return;
+    root.querySelectorAll('.analyze-summary-section, #analyze-summary-counts')
+        .forEach((el) => { el.innerHTML = ''; });
+    if (!summary || !summary.counts) { root.style.display = 'none'; return; }
+    root.style.display = '';
+
+    // Six count tiles across the top — same shape as the Analytics Overview
+    // cards on the sidebar so the visual language matches.
+    const counts = summary.counts || {};
+    const countTiles = [
+      { label: 'Persons',          value: counts.persons },
+      { label: 'Vehicles',         value: counts.vehicles },
+      { label: 'Faces recognized', value: counts.faces_recognized },
+      { label: 'Plates read',      value: counts.plates_read },
+      { label: 'Loitering events', value: counts.loitering_events },
+      { label: 'Fire / smoke',     value: counts.fire_events },
+    ];
+    const countsEl = document.getElementById('analyze-summary-counts');
+    for (const t of countTiles) {
+      const el = document.createElement('div');
+      el.className = 'analyze-count';
+      el.innerHTML = `<div class="analyze-count-value"></div><div class="analyze-count-label"></div>`;
+      el.querySelector('.analyze-count-value').textContent = t.value ?? 0;
+      el.querySelector('.analyze-count-label').textContent = t.label;
+      countsEl.appendChild(el);
+    }
+
+    function fillSection(id, title, items) {
+      const el = document.getElementById(id);
+      if (!items || !items.length) return;
+      el.innerHTML = `
+        <div class="analyze-summary-title"></div>
+        <table class="analyze-summary-table">
+          <thead>
+            <tr>
+              <th>Snapshot</th>
+              <th>Subject</th>
+              <th>Detail</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      `;
+      el.querySelector('.analyze-summary-title').textContent = title;
+      const tbody = el.querySelector('tbody');
+      for (const it of items) tbody.appendChild(buildIncidentRow(it));
+    }
+
+    fillSection('analyze-summary-faces', 'Recognized faces',
+      (summary.faces || []).map(f => ({
+        snap: f.snap, title: f.name,
+        subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
+        first_s: f.first_s,
+      })));
+
+    fillSection('analyze-summary-plates', 'License plates',
+      (summary.plates || []).map(p => ({
+        snap: p.snap, title: p.plate,
+        subtitle: p.vehicleType || 'vehicle',
+        first_s: p.first_s,
+      })));
+
+    fillSection('analyze-summary-loitering', 'Loitering incidents',
+      (summary.loitering || []).map(l => ({
+        snap: l.snap, title: `Track #${l.trackId}`,
+        subtitle: `Peak dwell ${l.peak_dwell_s}s`,
+        first_s: l.first_s,
+      })));
+
+    fillSection('analyze-summary-fire', 'Fire / smoke incidents',
+      (summary.fire || []).map((f, i) => ({
+        snap: f.snap, title: `Fire event ${i + 1}`,
+        subtitle: '',
+        first_s: f.first_s,
+      })));
   }
 
   // Wire event handlers once — the page may be revisited many times but the

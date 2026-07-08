@@ -396,6 +396,19 @@ app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
             });
             continue;
           }
+          if (msg.type === 'summary') {
+            // End-of-job stats + keyframes. Stashed on the job so the client
+            // can retrieve them via GET /analyze-video/:id and via the `done`
+            // event fan-out. Frontend renders a counts grid + thumbnail rail.
+            job.summary = {
+              counts: msg.counts,
+              faces: msg.faces,
+              plates: msg.plates,
+              loitering: msg.loitering,
+              fire: msg.fire,
+            };
+            continue;
+          }
         } catch { /* fall through to raw log */ }
       }
       console.log(`[analyze:${jobId.slice(0,8)}] ${line}`);
@@ -415,6 +428,7 @@ app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
       emitToUser(userId, 'analyze_progress', {
         jobId, status: 'done', progress: 1,
         outputUrl: `/analyze-video/${jobId}/output`,
+        summary: job.summary || null,
       });
       console.log(`[analyze] job ${jobId} done — ${outputPath}`);
     } else {
@@ -485,6 +499,20 @@ app.get('/analyze-video/:id/output', (req, res) => {
   const stream = fs.createReadStream(abs);
   stream.on('error', (err) => { console.error('[analyze] stream err:', err.message); res.destroy(); });
   stream.pipe(res);
+});
+
+// Serves the keyframe JPEGs the analyzer wrote for the summary rail.
+// Path is constrained to the job's _snaps directory to prevent traversal.
+app.get('/analyze-video/:id/snapshot/:file', (req, res) => {
+  const job = analyzeJobs.get(req.params.id);
+  if (!job || job.userId !== req.user.uid) return res.status(404).json({ error: 'not found' });
+  const snapDir = path.resolve(path.dirname(job.outputPath), '_snaps');
+  const abs = path.resolve(snapDir, req.params.file);
+  if (!abs.startsWith(snapDir + path.sep)) return res.status(403).json({ error: 'forbidden' });
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: 'snapshot missing' });
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  fs.createReadStream(abs).pipe(res);
 });
 
 app.delete('/analyze-video/:id', (req, res) => {

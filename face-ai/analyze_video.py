@@ -161,6 +161,45 @@ def process_video(input_path, output_path, enrollment_dir=None,
     fire_prev_sig = None
     fire_streak   = 0
 
+    # ── Summary state (emitted at end of job) ──────────────────
+    # Counters + keyframe snapshots that the UI shows under the video player.
+    # We save one small (~480px wide) JPEG per notable "first occurrence" so the
+    # user can click through to the moment each face/plate/loitering/fire fired.
+    snap_dir = os.path.join(os.path.dirname(output_path), '_snaps')
+    try: os.makedirs(snap_dir, exist_ok=True)
+    except OSError: pass
+    summary = {
+        'persons_track_ids': set(),   # unique person track IDs
+        'vehicles_track_ids': set(),  # unique vehicle track IDs
+        'faces': {},        # name -> {'count', 'snap', 'first_s'}
+        'plates': {},       # plate string -> {'count', 'snap', 'first_s', 'vehicleType'}
+        'loitering': [],    # list of {'trackId', 'first_s', 'peak_dwell_s', 'snap'}
+        'fire': [],         # list of {'first_s', 'snap'}
+        # Track which loitering IDs we've already snapshotted so we only
+        # save one keyframe per person, not one per continuous frame.
+        '_loitering_seen': set(),
+    }
+
+    def save_keyframe(slug, frame_bgr, incidents=None, detections=None):
+        """Persist a burned-in JPEG for the summary rail. Returns basename or None."""
+        try:
+            ts_ms = int(time.time() * 1000)
+            # Slugs are trusted (we build them) but sanitize anyway.
+            safe = ''.join(c for c in slug if c.isalnum() or c in '-_')[:40] or 'k'
+            fname = f'{safe}_{ts_ms}.jpg'
+            path = os.path.join(snap_dir, fname)
+            # Downscale to 480px wide for a fast-loading thumb.
+            img = frame_bgr.copy()
+            h, w = img.shape[:2]
+            if w > 480:
+                scale = 480.0 / w
+                img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+            cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            return fname
+        except Exception as ex:
+            print(f'  [warn] keyframe save failed: {ex}', file=sys.stderr)
+            return None
+
     frame_idx = 0
     t0 = time.time()
     last_report = t0
@@ -183,6 +222,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
 
         detections = []
         incidents = []
+        # Keyframe writes deferred until AFTER boxes are drawn onto `out`, so
+        # the JPEGs saved for the summary rail include the same annotations
+        # you see in the playback. Each entry is (slug, dict, key_to_set).
+        pending_keyframes = []
 
         # 1. Face detection + recognition
         try:
@@ -227,6 +270,15 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         'confidence': float(d.categories[0].score if d.categories else 0),
                         'label': 'face', 'name': name,
                     })
+                    # Summary: capture the first frame each identity is confirmed.
+                    # Defer the actual JPEG write until after boxes are drawn.
+                    if name:
+                        entry = summary['faces'].setdefault(name, {
+                            'count': 0, 'snap': None, 'first_s': now,
+                        })
+                        entry['count'] += 1
+                        if entry['snap'] is None and not any(p[1] is entry for p in pending_keyframes):
+                            pending_keyframes.append((f'face-{name}', entry, 'snap'))
                 for bucket in list(name_streaks.keys()):
                     if bucket not in seen_buckets:
                         del name_streaks[bucket]
@@ -265,7 +317,9 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         if bw * bh < person_min_area: continue
                         det = {'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
                                'confidence': conf, 'label': 'person'}
-                        if tid is not None: det['trackId'] = tid
+                        if tid is not None:
+                            det['trackId'] = tid
+                            summary['persons_track_ids'].add(tid)
                         detections.append(det)
                         if tid is not None:
                             st = loitering_state.get(tid)
@@ -313,6 +367,8 @@ def process_video(input_path, output_path, enrollment_dir=None,
                     elif label in detect.VEHICLE_CLASSES:
                         bw = bx[2] - bx[0]; bh = bx[3] - bx[1]
                         if bw * bh < 0.01: continue
+                        if tid is not None:
+                            summary['vehicles_track_ids'].add(tid)
                         detections.append({'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
                                            'confidence': conf, 'label': 'vehicle',
                                            'vehicleType': label,
@@ -352,6 +408,21 @@ def process_video(input_path, output_path, enrollment_dir=None,
                 'box': [x0, y0, x0 + bw0, y0 + bh0],
                 'trackId': tid, 'dwellSeconds': round(dwell, 1),
             })
+            # Summary: one keyframe per track that crosses the threshold; also
+            # update the peak dwell so the final rail shows the longest stay.
+            if tid not in summary['_loitering_seen']:
+                summary['_loitering_seen'].add(tid)
+                new_entry = {
+                    'trackId': tid, 'first_s': round(now, 1),
+                    'peak_dwell_s': round(dwell, 1),
+                    'snap': None,
+                }
+                summary['loitering'].append(new_entry)
+                pending_keyframes.append((f'loit-{tid}', new_entry, 'snap'))
+            else:
+                for e in summary['loitering']:
+                    if e['trackId'] == tid and dwell > e['peak_dwell_s']:
+                        e['peak_dwell_s'] = round(dwell, 1)
 
         # 4. Plate pipeline — sampled per vehicle track (OCR is expensive)
         try:
@@ -391,6 +462,14 @@ def process_video(input_path, output_path, enrollment_dir=None,
                                           'box': [axn, ayn, axn + awn, ayn + ahn],
                                           'plate': winner[0], 'trackId': tid,
                                           'vehicleType': veh_label})
+                        # Summary: one keyframe per unique confirmed plate.
+                        entry = summary['plates'].setdefault(winner[0], {
+                            'count': 0, 'snap': None, 'first_s': round(now, 1),
+                            'vehicleType': veh_label,
+                        })
+                        entry['count'] += 1
+                        if entry['snap'] is None and not any(p[1] is entry for p in pending_keyframes):
+                            pending_keyframes.append((f'plate-{tid}', entry, 'snap'))
                 detections.append({
                     'x': axn, 'y': ayn, 'w': awn, 'h': ahn,
                     'confidence': best['conf'] or 0.5,
@@ -448,6 +527,15 @@ def process_video(input_path, output_path, enrollment_dir=None,
             except Exception as ex:
                 print(f'  [warn] fire: {ex}', file=sys.stderr)
 
+        # Summary: dedup fire events — new event if last one was ≥ 5s ago,
+        # so a continuous flame emits one entry, not one per frame.
+        if any(inc.get('type') in ('fire', 'smoke') for inc in incidents):
+            new_event = (not summary['fire']) or (now - summary['fire'][-1]['first_s'] > 5.0)
+            if new_event:
+                new_fire = {'first_s': round(now, 1), 'snap': None}
+                summary['fire'].append(new_fire)
+                pending_keyframes.append((f'fire-{frame_idx}', new_fire, 'snap'))
+
         # ── Draw on the full-res output frame ─────────────────
         H, W = frame.shape[:2]
         out = frame  # in-place is fine, we don't reuse original
@@ -501,6 +589,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
         cv2.putText(out, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (255, 255, 255), 1, cv2.LINE_AA)
 
+        # Flush any keyframe writes now that boxes are burned onto `out`.
+        for slug, target, key in pending_keyframes:
+            target[key] = save_keyframe(slug, out)
+
         writer.write(out)
 
         # Progress every second of wall clock.
@@ -541,6 +633,43 @@ def process_video(input_path, output_path, enrollment_dir=None,
             print(json.dumps({'type': 'phase', 'name': 'done'}), flush=True)
 
     print(f'\nDone in {time.time()-t0:.1f}s — output written to {output_path}')
+
+    # ── Emit summary envelope for the UI to render stats + keyframes ──
+    # `snap_dir` sits next to the output MP4 in the analyze_jobs job folder;
+    # the backend exposes files under it via /analyze-video/:id/snapshot/:file.
+    if progress_json:
+        payload = {
+            'type': 'summary',
+            'counts': {
+                'persons': len(summary['persons_track_ids']),
+                'vehicles': len(summary['vehicles_track_ids']),
+                'faces_recognized': len(summary['faces']),
+                'plates_read': len(summary['plates']),
+                'loitering_events': len(summary['loitering']),
+                'fire_events': len(summary['fire']),
+            },
+            'faces': [
+                {'name': k, 'count': v['count'], 'snap': v['snap'], 'first_s': round(v['first_s'], 1)}
+                for k, v in summary['faces'].items()
+            ],
+            'plates': [
+                {'plate': k, 'count': v['count'], 'snap': v['snap'],
+                 'first_s': v['first_s'], 'vehicleType': v['vehicleType']}
+                for k, v in summary['plates'].items()
+            ],
+            'loitering': summary['loitering'],
+            'fire': summary['fire'],
+        }
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+    else:
+        # Human-readable summary for CLI users.
+        print(f"Persons (unique tracks): {len(summary['persons_track_ids'])}")
+        print(f"Vehicles (unique tracks): {len(summary['vehicles_track_ids'])}")
+        print(f"Faces recognized: {len(summary['faces'])} — {', '.join(summary['faces'].keys())}")
+        print(f"Plates read: {len(summary['plates'])} — {', '.join(summary['plates'].keys())}")
+        print(f"Loitering events: {len(summary['loitering'])}")
+        print(f"Fire/smoke events: {len(summary['fire'])}")
+
     return 0
 
 
