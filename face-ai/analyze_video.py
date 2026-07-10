@@ -57,6 +57,16 @@ COLOR_VEHICLE    = (184, 163, 148)    # #94a3b8
 COLOR_PLATE      = (238, 210, 34)     # #22d3ee
 COLOR_INCIDENT   = (68, 68, 239)      # #ef4444
 
+# ── Plate OCR tuning (analyzer only) ──────────────────────
+# The live pipeline in detect.py is conservative — wants two agreeing reads
+# before publishing a plate string, which is right for continuous streams
+# but too strict for the offline analyzer where each vehicle may only be
+# in-frame for one or two OCR windows. We monkey-patch detect's module-level
+# constants down for this subprocess only (safe — analyze_video runs in its
+# own process, doesn't share memory with the live worker).
+detect.PLATE_CONFIRM_READS = 1     # publish plate on first successful OCR
+detect.PLATE_MIN_CONF      = 0.20  # accept lower-confidence Bangla reads
+
 # ── Loitering re-association ──────────────────────────────
 # ByteTrack drops IDs on occlusion / low-confidence frames and re-issues a
 # new ID when the person reappears. Without stitching, the loitering dwell
@@ -509,10 +519,16 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         entry['count'] += 1
                         if entry['snap'] is None and not any(p[1] is entry for p in pending_keyframes):
                             pending_keyframes.append((f'plate-{tid}', entry, 'snap'))
+                # Show the plate string on the box as soon as OCR reads it —
+                # confirmation (2+ agreeing reads) still gates the summary rail
+                # and incident entry, but the label should reflect what the
+                # OCR just saw so the user isn't looking at a blank "plate"
+                # box while the string sits in the voting buffer.
+                display_name = ps['plate'] or (text if text else None)
                 detections.append({
                     'x': axn, 'y': ayn, 'w': awn, 'h': ahn,
                     'confidence': best['conf'] or 0.5,
-                    'label': 'plate', 'name': ps['plate'], 'trackId': tid,
+                    'label': 'plate', 'name': display_name, 'trackId': tid,
                 })
         except Exception as ex:
             print(f'  [warn] plate: {ex}', file=sys.stderr)
