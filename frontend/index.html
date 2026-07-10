@@ -5,7 +5,9 @@
   <meta charset="utf-8">
   <title>SecureVision · Surveillance Dashboard</title>
   <link rel="stylesheet" href="vendor/leaflet.css">
-  <link rel="stylesheet" href="style.css">
+  <!-- Cache-bust: bump the ?v= number whenever style.css changes so browsers don't
+       serve a stale copy. Frontend has no build step so this is manual. -->
+  <link rel="stylesheet" href="style.css?v=2">
   <!-- Inter font from Google Fonts is non-blocking: if offline / air-gapped,
        the CSS font stack falls back to system-ui (still looks clean). -->
   <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
@@ -639,6 +641,7 @@
             </div>
             <div class="analyze-summary" id="analyze-summary" style="display:none">
               <div class="analyze-summary-counts" id="analyze-summary-counts"></div>
+              <div class="analyze-summary-tabs" id="analyze-summary-tabs" role="tablist"></div>
               <div class="analyze-summary-section" id="analyze-summary-events"></div>
             </div>
           </div>
@@ -846,6 +849,7 @@
     <button data-action="remove" class="danger"><svg><use href="#i-x"/></svg>Remove camera</button>
   </div>
 
-  <script src="app.js"></script>
+  <!-- Same cache-bust rule as style.css above — bump the ?v= number when app.js changes. -->
+  <script src="app.js?v=2"></script>
 </body>
 </html>

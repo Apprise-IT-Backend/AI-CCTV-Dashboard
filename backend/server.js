@@ -415,6 +415,8 @@ app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
             // event fan-out. Frontend renders a counts grid + thumbnail rail.
             job.summary = {
               counts: msg.counts,
+              persons: msg.persons,
+              vehicles: msg.vehicles,
               faces: msg.faces,
               plates: msg.plates,
               loitering: msg.loitering,

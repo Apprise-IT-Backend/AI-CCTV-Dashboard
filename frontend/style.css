@@ -1884,30 +1884,44 @@ input:focus {
   border: 1px solid var(--border); transition: border-color .15s;
 }
 .analyze-row-img:hover { border-color: var(--accent); }
-.analyze-row-event { width: 140px; min-width: 140px; }
 .analyze-row-title { font-weight: 600; }
 .analyze-row-sub { color: var(--text-secondary); }
 .analyze-row-time { text-align: right; width: 90px; }
 
-/* Event-type badges — colours match the box colours burned into the video */
-.analyze-event-badge {
-  display: inline-flex; align-items: center;
-  padding: 3px 10px; border-radius: 999px;
-  font-size: 11px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.04em;
-  border: 1px solid transparent; white-space: nowrap;
+/* Tab strip for summary categories */
+.analyze-summary-tabs {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 4px; background: var(--bg-elev);
+  border: 1px solid var(--border); border-radius: 10px;
 }
-.analyze-event-badge.ev-face  {
-  background: rgba(16,185,129, 0.15); color: #10b981; border-color: rgba(16,185,129, 0.4);
+.analyze-tab-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-radius: 8px;
+  background: transparent; border: 1px solid transparent;
+  color: var(--text-secondary); font-size: 13px; font-weight: 500;
+  cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s;
 }
-.analyze-event-badge.ev-plate {
-  background: rgba(34,211,238, 0.15); color: #22d3ee; border-color: rgba(34,211,238, 0.4);
+.analyze-tab-btn:hover { background: var(--bg-hover); color: var(--text); }
+.analyze-tab-btn.active {
+  background: var(--bg-hover); color: var(--text);
+  border-color: var(--border);
 }
-.analyze-event-badge.ev-loit  {
-  background: rgba(251,146,60, 0.15); color: #fb923c; border-color: rgba(251,146,60, 0.4);
+.analyze-tab-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 22px; padding: 1px 6px; border-radius: 999px;
+  background: var(--bg-hover); color: var(--text-secondary);
+  font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums;
 }
-.analyze-event-badge.ev-fire  {
-  background: rgba(239,68,68, 0.15);  color: #ef4444; border-color: rgba(239,68,68, 0.4);
+.analyze-tab-btn.active .analyze-tab-count {
+  background: var(--accent); color: #fff;
+}
+
+.analyze-summary-empty {
+  padding: 32px 16px; text-align: center;
+  color: var(--text-muted); font-size: 13px; font-style: italic;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 10px;
 }
 .analyze-time-btn {
   background: transparent; border: 1px solid var(--border);

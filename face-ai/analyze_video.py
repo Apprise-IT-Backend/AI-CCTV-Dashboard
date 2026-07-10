@@ -214,14 +214,15 @@ def process_video(input_path, output_path, enrollment_dir=None,
     try: os.makedirs(snap_dir, exist_ok=True)
     except OSError: pass
     summary = {
-        'persons_track_ids': set(),   # unique person track IDs
-        'vehicles_track_ids': set(),  # unique vehicle track IDs
+        # Per-unique-track dicts: track_id -> {'first_s', 'snap', 'vehicleType'?}.
+        # Populated the first frame each track is observed, then displayed as a
+        # dedicated "Persons" / "Vehicles" tab with one row per unique subject.
+        'persons': {},
+        'vehicles': {},
         'faces': {},        # name -> {'count', 'snap', 'first_s'}
         'plates': {},       # plate string -> {'count', 'snap', 'first_s', 'vehicleType'}
         'loitering': [],    # list of {'trackId', 'first_s', 'peak_dwell_s', 'snap'}
         'fire': [],         # list of {'first_s', 'snap'}
-        # Track which loitering IDs we've already snapshotted so we only
-        # save one keyframe per person, not one per continuous frame.
         '_loitering_seen': set(),
     }
 
@@ -368,7 +369,13 @@ def process_video(input_path, output_path, enrollment_dir=None,
                                'confidence': conf, 'label': 'person'}
                         if tid is not None:
                             det['trackId'] = tid
-                            summary['persons_track_ids'].add(tid)
+                            # Save one keyframe per unique person track_id
+                            # (the first frame we see them in). Boxes will be
+                            # burned onto `out` before the queue flushes.
+                            if tid not in summary['persons']:
+                                entry = {'trackId': tid, 'first_s': round(now, 1), 'snap': None}
+                                summary['persons'][tid] = entry
+                                pending_keyframes.append((f'person-{tid}', entry, 'snap'))
                         detections.append(det)
                         if tid is not None:
                             st = loitering_state.get(tid)
@@ -416,8 +423,11 @@ def process_video(input_path, output_path, enrollment_dir=None,
                     elif label in detect.VEHICLE_CLASSES:
                         bw = bx[2] - bx[0]; bh = bx[3] - bx[1]
                         if bw * bh < 0.01: continue
-                        if tid is not None:
-                            summary['vehicles_track_ids'].add(tid)
+                        if tid is not None and tid not in summary['vehicles']:
+                            entry = {'trackId': tid, 'first_s': round(now, 1),
+                                     'vehicleType': label, 'snap': None}
+                            summary['vehicles'][tid] = entry
+                            pending_keyframes.append((f'vehicle-{tid}', entry, 'snap'))
                         detections.append({'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
                                            'confidence': conf, 'label': 'vehicle',
                                            'vehicleType': label,
@@ -692,17 +702,22 @@ def process_video(input_path, output_path, enrollment_dir=None,
     # ── Emit summary envelope for the UI to render stats + keyframes ──
     # `snap_dir` sits next to the output MP4 in the analyze_jobs job folder;
     # the backend exposes files under it via /analyze-video/:id/snapshot/:file.
+    # Sort persons + vehicles by first-seen time so tabs read chronologically.
+    persons_list  = sorted(summary['persons'].values(),  key=lambda e: e['first_s'])
+    vehicles_list = sorted(summary['vehicles'].values(), key=lambda e: e['first_s'])
     if progress_json:
         payload = {
             'type': 'summary',
             'counts': {
-                'persons': len(summary['persons_track_ids']),
-                'vehicles': len(summary['vehicles_track_ids']),
+                'persons': len(persons_list),
+                'vehicles': len(vehicles_list),
                 'faces_recognized': len(summary['faces']),
                 'plates_read': len(summary['plates']),
                 'loitering_events': len(summary['loitering']),
                 'fire_events': len(summary['fire']),
             },
+            'persons':  persons_list,
+            'vehicles': vehicles_list,
             'faces': [
                 {'name': k, 'count': v['count'], 'snap': v['snap'], 'first_s': round(v['first_s'], 1)}
                 for k, v in summary['faces'].items()
@@ -718,8 +733,8 @@ def process_video(input_path, output_path, enrollment_dir=None,
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     else:
         # Human-readable summary for CLI users.
-        print(f"Persons (unique tracks): {len(summary['persons_track_ids'])}")
-        print(f"Vehicles (unique tracks): {len(summary['vehicles_track_ids'])}")
+        print(f"Persons (unique tracks): {len(persons_list)}")
+        print(f"Vehicles (unique tracks): {len(vehicles_list)}")
         print(f"Faces recognized: {len(summary['faces'])} — {', '.join(summary['faces'].keys())}")
         print(f"Plates read: {len(summary['plates'])} — {', '.join(summary['plates'].keys())}")
         print(f"Loitering events: {len(summary['loitering'])}")

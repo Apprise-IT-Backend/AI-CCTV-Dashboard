@@ -2588,6 +2588,8 @@ window.analyzeModule = (() => {
 
   // Per-event visual metadata — must match the box colors burned into the video.
   const EVENT_META = {
+    person:    { label: 'Person',           cls: 'ev-person' },
+    vehicle:   { label: 'Vehicle',          cls: 'ev-vehicle' },
     face:      { label: 'Face Recognized',  cls: 'ev-face' },
     plate:     { label: 'Plate Read',       cls: 'ev-plate' },
     loitering: { label: 'Loitering',        cls: 'ev-loit' },
@@ -2595,15 +2597,12 @@ window.analyzeModule = (() => {
   };
 
   function buildIncidentRow(item) {
-    // Single unified row: Snapshot | Event badge | Subject | Detail | Time.
-    // Modelled on the Incidents page — the event badge is what tells the user
-    // at a glance which detector fired (loitering vs face vs plate vs fire),
-    // without them having to read the section header.
-    const meta = EVENT_META[item.event] || { label: item.event, cls: '' };
+    // Table row: Snapshot | Subject | Detail | Time. The tab header already
+    // tells the user which category this row belongs to, so no need to repeat
+    // the event type in every row.
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="analyze-row-thumb"></td>
-      <td class="analyze-row-event"></td>
       <td class="analyze-row-title"></td>
       <td class="analyze-row-sub"></td>
       <td class="analyze-row-time"></td>
@@ -2614,15 +2613,11 @@ window.analyzeModule = (() => {
       img.alt = item.title;
       img.loading = 'lazy';
       img.className = 'analyze-row-img';
-      img.addEventListener('click', () => openSnapshotLightbox(img.src, `${meta.label}: ${item.title}`));
+      img.addEventListener('click', () => openSnapshotLightbox(img.src, item.title));
       tr.querySelector('.analyze-row-thumb').appendChild(img);
     } else {
       tr.querySelector('.analyze-row-thumb').textContent = '—';
     }
-    const badge = document.createElement('span');
-    badge.className = `analyze-event-badge ${meta.cls}`;
-    badge.textContent = meta.label;
-    tr.querySelector('.analyze-row-event').appendChild(badge);
     tr.querySelector('.analyze-row-title').textContent = item.title;
     tr.querySelector('.analyze-row-sub').textContent = item.subtitle || '';
     const timeBtn = document.createElement('button');
@@ -2634,10 +2629,37 @@ window.analyzeModule = (() => {
     return tr;
   }
 
+  // Track which tab is currently active. We keep the choice sticky within a
+  // single session so re-analyzing preserves the user's last view.
+  let activeTab = 'persons';
+
+  function renderTab(rows) {
+    const section = document.getElementById('analyze-summary-events');
+    if (!rows.length) {
+      section.innerHTML = `<div class="analyze-summary-empty">No entries in this category.</div>`;
+      return;
+    }
+    section.innerHTML = `
+      <table class="analyze-summary-table">
+        <thead>
+          <tr>
+            <th>Snapshot</th>
+            <th>Subject</th>
+            <th>Detail</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    `;
+    const tbody = section.querySelector('tbody');
+    for (const r of rows) tbody.appendChild(buildIncidentRow(r));
+  }
+
   function renderSummary(summary) {
     const root = document.getElementById('analyze-summary');
     if (!root) return;
-    root.querySelectorAll('.analyze-summary-section, #analyze-summary-counts')
+    root.querySelectorAll('#analyze-summary-counts, #analyze-summary-tabs, #analyze-summary-events')
         .forEach((el) => { el.innerHTML = ''; });
     if (!summary || !summary.counts) { root.style.display = 'none'; return; }
     root.style.display = '';
@@ -2663,55 +2685,75 @@ window.analyzeModule = (() => {
       countsEl.appendChild(el);
     }
 
-    // Flatten all four event types into a single chronologically-sorted list
-    // so the reader sees "what happened, and when" in reading order — same
-    // pattern as the Incidents page. The `event` tag drives the coloured
-    // badge in each row.
-    const rows = [];
-    for (const f of summary.faces || []) rows.push({
-      event: 'face', snap: f.snap, title: f.name,
-      subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
-      first_s: f.first_s,
-    });
-    for (const p of summary.plates || []) rows.push({
-      event: 'plate', snap: p.snap, title: p.plate,
-      subtitle: p.vehicleType || 'vehicle',
-      first_s: p.first_s,
-    });
-    for (const l of summary.loitering || []) rows.push({
-      event: 'loitering', snap: l.snap, title: `Track #${l.trackId}`,
-      subtitle: `Peak dwell ${l.peak_dwell_s}s`,
-      first_s: l.first_s,
-    });
-    for (let i = 0; i < (summary.fire || []).length; i++) {
-      const f = summary.fire[i];
-      rows.push({
-        event: 'fire', snap: f.snap, title: `Event ${i + 1}`,
-        subtitle: '', first_s: f.first_s,
-      });
-    }
-    rows.sort((a, b) => (a.first_s || 0) - (b.first_s || 0));
+    // Build the per-tab row sets. Row objects are the same shape as
+    // buildIncidentRow expects: { snap, title, subtitle, first_s }.
+    const tabRows = {
+      persons: (summary.persons || []).map(p => ({
+        snap: p.snap, title: `Track #${p.trackId}`, subtitle: '',
+        first_s: p.first_s,
+      })),
+      vehicles: (summary.vehicles || []).map(v => ({
+        snap: v.snap, title: `Track #${v.trackId}`,
+        subtitle: v.vehicleType || 'vehicle', first_s: v.first_s,
+      })),
+      faces: (summary.faces || []).map(f => ({
+        snap: f.snap, title: f.name,
+        subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
+        first_s: f.first_s,
+      })),
+      plates: (summary.plates || []).map(p => ({
+        snap: p.snap, title: p.plate,
+        subtitle: p.vehicleType || 'vehicle', first_s: p.first_s,
+      })),
+      loitering: (summary.loitering || []).map(l => ({
+        snap: l.snap, title: `Track #${l.trackId}`,
+        subtitle: `Peak dwell ${l.peak_dwell_s}s`, first_s: l.first_s,
+      })),
+      fire: (summary.fire || []).map((f, i) => ({
+        snap: f.snap, title: `Event ${i + 1}`, subtitle: '',
+        first_s: f.first_s,
+      })),
+    };
 
-    const eventsSection = document.getElementById('analyze-summary-events');
-    if (rows.length) {
-      eventsSection.innerHTML = `
-        <div class="analyze-summary-title">Detected Events</div>
-        <table class="analyze-summary-table">
-          <thead>
-            <tr>
-              <th>Snapshot</th>
-              <th>Event</th>
-              <th>Subject</th>
-              <th>Detail</th>
-              <th>Time</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      `;
-      const tbody = eventsSection.querySelector('tbody');
-      for (const r of rows) tbody.appendChild(buildIncidentRow(r));
+    // Sort every tab by first-seen time so entries read chronologically.
+    for (const k of Object.keys(tabRows)) {
+      tabRows[k].sort((a, b) => (a.first_s || 0) - (b.first_s || 0));
     }
+
+    // Build the tab bar. Each button holds a "pill" showing the row count so
+    // the user can pick a category at a glance without switching to inspect it.
+    const tabsEl = document.getElementById('analyze-summary-tabs');
+    const tabDefs = [
+      { key: 'persons',   label: 'Persons'   },
+      { key: 'vehicles',  label: 'Vehicles'  },
+      { key: 'faces',     label: 'Faces'     },
+      { key: 'plates',    label: 'Plates'    },
+      { key: 'loitering', label: 'Loitering' },
+      { key: 'fire',      label: 'Fire'      },
+    ];
+    // Default to the first non-empty tab if the sticky choice is empty.
+    if (!tabRows[activeTab] || tabRows[activeTab].length === 0) {
+      const firstFilled = tabDefs.find(t => tabRows[t.key].length > 0);
+      if (firstFilled) activeTab = firstFilled.key;
+    }
+    for (const t of tabDefs) {
+      const btn = document.createElement('button');
+      btn.className = `analyze-tab-btn ${EVENT_META[t.key === 'persons' ? 'person' : t.key === 'vehicles' ? 'vehicle' : t.key]?.cls || ''}${activeTab === t.key ? ' active' : ''}`;
+      btn.dataset.tabKey = t.key;
+      btn.innerHTML = `<span></span><span class="analyze-tab-count"></span>`;
+      btn.querySelector('span').textContent = t.label;
+      btn.querySelector('.analyze-tab-count').textContent = tabRows[t.key].length;
+      btn.addEventListener('click', () => {
+        activeTab = t.key;
+        tabsEl.querySelectorAll('.analyze-tab-btn').forEach(b =>
+          b.classList.toggle('active', b.dataset.tabKey === t.key));
+        renderTab(tabRows[t.key]);
+      });
+      tabsEl.appendChild(btn);
+    }
+
+    // Initial render for the currently-active tab.
+    renderTab(tabRows[activeTab] || []);
   }
 
   // Wire event handlers once — the page may be revisited many times but the
