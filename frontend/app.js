@@ -2464,6 +2464,7 @@ window.analyzeModule = (() => {
     fd.append('useEnrollment', document.getElementById('analyze-enrollment').checked ? 'true' : 'false');
     fd.append('detectFire',    document.getElementById('analyze-fire').checked ? 'true' : 'false');
     fd.append('personSensitivity', document.getElementById('analyze-person-sensitivity').value || 'balanced');
+    fd.append('detectionQuality',  document.getElementById('analyze-detection-quality').value || 'fast');
 
     try {
       const resp = await fetch(`${API}/analyze-video`, {
@@ -2497,6 +2498,17 @@ window.analyzeModule = (() => {
   function onProgress(msg) {
     if (!msg || msg.jobId !== state.jobId) return;
     if (msg.status === 'running') {
+      if (msg.phase === 'loading') {
+        // Pre-detection warmup: model downloads (~52 MB for "Best" preset on
+        // first use) + weights load. No frame progress yet — show an indeterminate
+        // "Loading models…" state so 0/0 doesn't look like a hang.
+        $progFill().style.width = '20%';
+        $progPct().textContent = 'Loading models…';
+        $progFrames().textContent = 'First "Best" run downloads ~52 MB';
+        $progFps().textContent = '';
+        $progEta().textContent = '';
+        return;
+      }
       if (msg.phase === 'encoding') {
         // Frame loop finished; ffmpeg re-encode is running (can be a minute+
         // on 4K CPU). Keep the bar full and swap labels so it doesn't look frozen.
@@ -2507,6 +2519,7 @@ window.analyzeModule = (() => {
         $progEta().textContent = '';
         return;
       }
+      // Phase === 'detecting' (or omitted) — regular per-frame progress below.
       const pct = Math.max(0, Math.min(1, msg.progress || 0));
       $progFill().style.width = `${(pct * 100).toFixed(1)}%`;
       $progPct().textContent = `${(pct * 100).toFixed(1)}%`;

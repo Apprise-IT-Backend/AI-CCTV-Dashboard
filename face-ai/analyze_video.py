@@ -102,7 +102,16 @@ def draw_label(img, x, y, text, color, above=True):
 
 def process_video(input_path, output_path, enrollment_dir=None,
                   downscale=0.5, loitering_seconds=30, progress_json=False,
-                  detect_fire=True, person_conf=0.4, person_min_area=0.005):
+                  detect_fire=True, person_conf=0.4, person_min_area=0.005,
+                  yolo_model_path=None, yolo_imgsz=None):
+    # First-run "Best" quality auto-downloads ~52 MB of weights and loads a
+    # much heavier model — the whole warmup can take 30-60s on CPU during
+    # which no `progress` lines are emitted. Signal a phase change up front
+    # so the UI can show "Loading models…" instead of a frozen 0/0.
+    def emit(payload):
+        if progress_json:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+    emit({'type': 'phase', 'name': 'loading'})
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         print(f'ERROR: cannot open {input_path}', file=sys.stderr)
@@ -140,6 +149,32 @@ def process_video(input_path, output_path, enrollment_dir=None,
     print(f'Downscale: {downscale}  |  Loitering: {loitering_seconds}s')
     print(f'Fire: {"on" if detect_fire else "off"}  |  '
           f'Person: conf>={person_conf}, min-area>={person_min_area}')
+
+    # Optionally swap the YOLO detector for a larger variant. Ultralytics
+    # accepts a bare name like "yolov8s.pt" and auto-downloads on first use.
+    # Larger variants (s/m/l/x) give substantially better recall on small /
+    # distant subjects; combine with a higher --yolo-imgsz for the biggest
+    # improvement, at proportional CPU cost. When no override is given we
+    # reuse the model detect.py already loaded (yolov8n.pt).
+    from ultralytics import YOLO as _YOLO
+    yolo_model = detect.yolo_model
+    if yolo_model_path:
+        try:
+            path = yolo_model_path
+            if not os.path.isabs(path) and not os.path.exists(path):
+                cand = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+                if os.path.exists(cand): path = cand
+            print(f'Loading alt YOLO: {path}...')
+            yolo_model = _YOLO(path)
+        except Exception as ex:
+            print(f'  [warn] alt YOLO load failed ({ex}) — falling back to yolov8n', file=sys.stderr)
+            yolo_model = detect.yolo_model
+    yolo_kwargs = {'verbose': False}
+    if yolo_imgsz:
+        yolo_kwargs['imgsz'] = int(yolo_imgsz)
+    print(f'YOLO: {os.path.basename(getattr(yolo_model, "ckpt_path", "yolov8n.pt"))}'
+          f'  imgsz={yolo_imgsz or 640}')
+
     print(f'Enrollment: {enrollment_dir or "(none - face recognition disabled)"}')
     print()
 
@@ -199,6 +234,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
         except Exception as ex:
             print(f'  [warn] keyframe save failed: {ex}', file=sys.stderr)
             return None
+
+    # Models are loaded and everything is warm — flip the UI out of the
+    # "Loading models…" state so the progress bar can start moving.
+    emit({'type': 'phase', 'name': 'detecting'})
 
     frame_idx = 0
     t0 = time.time()
@@ -290,15 +329,15 @@ def process_video(input_path, output_path, enrollment_dir=None,
         try:
             with detect.yolo_lock:
                 try:
-                    yres = detect.yolo_model.track(small, persist=True,
-                                                   tracker='bytetrack.yaml',
-                                                   verbose=False)[0]
+                    yres = yolo_model.track(small, persist=True,
+                                             tracker='bytetrack.yaml',
+                                             **yolo_kwargs)[0]
                 except Exception:
-                    yres = detect.yolo_model(small, verbose=False)[0]
+                    yres = yolo_model(small, **yolo_kwargs)[0]
                 for box in yres.boxes:
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
-                    label = detect.yolo_model.names[cls_id]
+                    label = yolo_model.names[cls_id]
                     # Per-class gates: persons use the user-tunable conf/area
                     # (default 0.4 / 0.5% area — much looser than vehicles);
                     # vehicles + everything else stick with the strict 0.6
@@ -737,6 +776,14 @@ def main():
                     help='Reject person boxes below this relative area (0..1). Default 0.005 '
                          '(0.5%% of frame). Was 0.05 for near-camera CCTV — too aggressive '
                          'for wide street shots.')
+    ap.add_argument('--yolo-model', default=None,
+                    help='YOLO weights filename (relative to face-ai/) or absolute path. '
+                         'Default reuses detect.py\'s yolov8n.pt. Try yolov8s.pt / yolov8m.pt '
+                         'for far-better small-object recall (ultralytics auto-downloads).')
+    ap.add_argument('--yolo-imgsz', type=int, default=None,
+                    help='YOLO inference resolution. Default 640 (ultralytics default). '
+                         'Push to 960 or 1280 to catch distant/small people — CPU cost '
+                         'scales ~quadratically.')
     args = ap.parse_args()
 
     if not os.path.isfile(args.input):
@@ -752,7 +799,9 @@ def main():
                          progress_json=args.progress_json,
                          detect_fire=not args.no_fire,
                          person_conf=args.person_conf,
-                         person_min_area=args.person_min_area)
+                         person_min_area=args.person_min_area,
+                         yolo_model_path=args.yolo_model,
+                         yolo_imgsz=args.yolo_imgsz)
 
 
 if __name__ == '__main__':

@@ -324,6 +324,17 @@ app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
   };
   const preset = PERSON_PRESETS[opts.personSensitivity] || PERSON_PRESETS.balanced;
 
+  // Detection quality — swaps the YOLO model + inference resolution. Bigger
+  // model + higher imgsz = far better recall on distant/small subjects,
+  // at proportional CPU cost. Ultralytics auto-downloads the larger variants
+  // on first use, so no manual weight fetch is required.
+  const QUALITY_PRESETS = {
+    fast:     { model: 'yolov8n.pt', imgsz: 640  },
+    balanced: { model: 'yolov8s.pt', imgsz: 960  },
+    best:     { model: 'yolov8m.pt', imgsz: 1280 },
+  };
+  const quality = QUALITY_PRESETS[opts.detectionQuality] || QUALITY_PRESETS.fast;
+
   const args = [
     '-u', ANALYZER, inputPath,
     '-o', outputPath,
@@ -331,6 +342,8 @@ app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
     '--loitering-seconds', String(loiteringSeconds),
     '--person-conf', String(preset.conf),
     '--person-min-area', String(preset.minArea),
+    '--yolo-model', quality.model,
+    '--yolo-imgsz', String(quality.imgsz),
     '--progress-json',
   ];
   if (!detectFire) args.push('--no-fire');

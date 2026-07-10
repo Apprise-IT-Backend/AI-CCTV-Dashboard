@@ -594,6 +594,14 @@
                   <option value="strict">Strict (near-camera CCTV only)</option>
                 </select>
               </label>
+              <label>
+                <span>Detection quality</span>
+                <select id="analyze-detection-quality">
+                  <option value="fast" selected>Fast — yolov8n @ 640 (default)</option>
+                  <option value="balanced">Balanced — yolov8s @ 960 (better on distant subjects)</option>
+                  <option value="best">Best — yolov8m @ 1280 (slowest, best small-object recall)</option>
+                </select>
+              </label>
               <label class="analyze-checkbox">
                 <input type="checkbox" id="analyze-enrollment" checked>
                 <span>Use my enrolled faces for name recognition</span>
