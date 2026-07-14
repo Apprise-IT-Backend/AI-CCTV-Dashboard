@@ -2836,11 +2836,11 @@ window.analyzeModule = (() => {
 
   // Wire event handlers once — the page may be revisited many times but the
   // DOM elements are static, so single listeners are enough.
-  // Turn a backend snapshot URL into a data: URL so it can be embedded in
-  // the self-contained HTML report — the file needs to be readable after
-  // the user's session ends and moves off-line, so external URLs (which
-  // would 401 without a token, and 404 after job cleanup) won't do.
-  async function snapAsDataUrl(fname) {
+  // Turn a backend snapshot URL into a base64 payload (no data: prefix) so
+  // ExcelJS can embed it. We also need the mime/extension to tell ExcelJS
+  // which subtype of image it is — every snapshot the analyzer writes is a
+  // JPEG, so we hardcode that rather than sniffing.
+  async function snapAsBase64(fname) {
     const url = snapUrl(fname);
     if (!url) return null;
     try {
@@ -2849,19 +2849,31 @@ window.analyzeModule = (() => {
       const blob = await res.blob();
       return await new Promise((resolve) => {
         const fr = new FileReader();
-        fr.onload  = () => resolve(fr.result);
+        fr.onload = () => {
+          const s = String(fr.result || '');
+          // FileReader returns "data:image/jpeg;base64,XXXX" — strip the prefix.
+          const i = s.indexOf(',');
+          resolve(i >= 0 ? s.slice(i + 1) : null);
+        };
         fr.onerror = () => resolve(null);
         fr.readAsDataURL(blob);
       });
     } catch (_) { return null; }
   }
 
-  // Escape a string for safe interpolation into HTML text/attribute contexts.
-  // The plate strings can contain Bangla; user filenames can contain anything.
-  function esc(s) {
-    return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c]));
+  // ExcelJS is loaded from a CDN on first click. ~900KB minified. Cached
+  // by the browser after first fetch. If the user is offline we surface a
+  // clean error message instead of a raw exception.
+  async function loadExcelJS() {
+    if (window.ExcelJS) return window.ExcelJS;
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load Excel library — check your internet connection.'));
+      document.head.appendChild(s);
+    });
+    return window.ExcelJS;
   }
 
   async function downloadReport() {
@@ -2870,13 +2882,13 @@ window.analyzeModule = (() => {
     const btn = $report();
     const orig = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Preparing…';
+    btn.textContent = 'Loading Excel…';
     try {
-      // Reuse the tab row-building logic from renderSummary so the report
-      // stays in lockstep with what the UI displays. We inline it here
-      // (rather than exporting) because the row shape is analyze-only and
-      // this way the report generator has no other dependencies.
-      const cat = (rows, title) => ({ title, rows });
+      const ExcelJS = await loadExcelJS();
+
+      // Row-build logic mirrors renderSummary so the exported spreadsheet
+      // is a 1:1 view of what's on-screen. Tags render as a `|`-separated
+      // string in the Tags column (Excel doesn't render coloured pills).
       const persons = (summary.persons || []).map(p => {
         const tags = [];
         if (p.recognized_name) tags.push(`Recognized: ${p.recognized_name}`);
@@ -2887,9 +2899,19 @@ window.analyzeModule = (() => {
         }
         if (p.segments > 1) tags.push(`Stitched from ${p.segments} segments`);
         return {
-          snap: p.snap, title: `Track #${p.trackId}`,
-          subtitle: `${p.frame_count} frames · avg conf ${Math.round((p.avg_conf || 0) * 100)}%`,
-          first_s: p.first_s, duration_s: p.duration_s, tags,
+          snap: p.snap,
+          values: [
+            null, // col A reserved for the image
+            `Track #${p.trackId}`,
+            p.recognized_name || '',
+            p.face_seen ? 'Yes' : 'No',
+            p.loitering ? 'Yes' : 'No',
+            tags.join(' | '),
+            fmtSecondsClock(p.first_s),
+            p.duration_s ?? 0,
+            p.frame_count ?? 0,
+            Math.round((p.avg_conf || 0) * 100) + '%',
+          ],
         };
       });
       const vehicles = (summary.vehicles || []).map(v => {
@@ -2897,152 +2919,194 @@ window.analyzeModule = (() => {
         if (v.plate) tags.push(`Plate: ${v.plate}`);
         if (v.segments > 1) tags.push(`Stitched from ${v.segments} segments`);
         return {
-          snap: v.snap, title: `Track #${v.trackId}`,
-          subtitle: `${v.frame_count} frames · avg conf ${Math.round((v.avg_conf || 0) * 100)}%`,
-          first_s: v.first_s, duration_s: v.duration_s, tags,
+          snap: v.snap,
+          values: [
+            null,
+            `Track #${v.trackId}`,
+            v.vehicleType || '',
+            v.plate || '',
+            tags.join(' | '),
+            fmtSecondsClock(v.first_s),
+            v.duration_s ?? 0,
+            v.frame_count ?? 0,
+            Math.round((v.avg_conf || 0) * 100) + '%',
+          ],
         };
       });
       const faces = (summary.faces || []).map(f => ({
-        snap: f.snap, title: f.name,
-        subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
-        first_s: f.first_s, tags: [],
+        snap: f.snap,
+        values: [null, f.name, f.count, fmtSecondsClock(f.first_s)],
       }));
       const plates = (summary.plates || []).map(p => ({
-        snap: p.snap, title: p.plate,
-        subtitle: p.vehicleType || 'vehicle', first_s: p.first_s, tags: [],
+        snap: p.snap,
+        values: [null, p.plate, p.vehicleType || 'vehicle', p.count, fmtSecondsClock(p.first_s)],
       }));
       const loitering = (summary.loitering || []).map(l => ({
-        snap: l.snap, title: `Track #${l.trackId}`,
-        subtitle: `Peak dwell ${l.peak_dwell_s}s`, first_s: l.first_s, tags: [],
+        snap: l.snap,
+        values: [null, `Track #${l.trackId}`, l.peak_dwell_s, fmtSecondsClock(l.first_s)],
       }));
       const fire = (summary.fire || []).map((f, i) => ({
-        snap: f.snap, title: `Event ${i + 1}`, subtitle: '',
-        first_s: f.first_s, tags: [],
+        snap: f.snap,
+        values: [null, `Event ${i + 1}`, fmtSecondsClock(f.first_s)],
       }));
-      const sections = [
-        cat(persons,   'Persons'),
-        cat(vehicles,  'Vehicles'),
-        cat(faces,     'Faces recognized'),
-        cat(plates,    'Plates read'),
-        cat(loitering, 'Loitering events'),
-        cat(fire,      'Fire / smoke'),
-      ].filter(s => s.rows.length > 0);
 
-      // Fetch every unique snapshot once and cache the data: URL. The rows
-      // often reference the same file (e.g., a "loitering" row and the
-      // corresponding "persons" row share a snap) so this de-dupes work.
-      const uniqueSnaps = [...new Set(
-        sections.flatMap(s => s.rows.map(r => r.snap).filter(Boolean))
-      )];
+      // Fetch each snapshot once as base64, cached and de-duped so the
+      // same image isn't downloaded twice (persons + loitering share files).
+      const allRows = [
+        ...persons, ...vehicles, ...faces, ...plates, ...loitering, ...fire,
+      ];
+      const uniqueSnaps = [...new Set(allRows.map(r => r.snap).filter(Boolean))];
       btn.textContent = `Preparing… 0/${uniqueSnaps.length} snapshots`;
-      const dataUrls = {};
+      const b64 = {};
       let done = 0;
-      // Fire off in parallel but with a soft cap (8) so slow networks don't
-      // choke — Promise.all with unbounded concurrency can DoS the backend.
       const queue = uniqueSnaps.slice();
-      const workers = new Array(Math.min(8, queue.length)).fill(0).map(async () => {
+      const workers = new Array(Math.min(8, Math.max(1, queue.length))).fill(0).map(async () => {
         while (queue.length) {
           const s = queue.shift();
-          dataUrls[s] = await snapAsDataUrl(s);
+          b64[s] = await snapAsBase64(s);
           done += 1;
           btn.textContent = `Preparing… ${done}/${uniqueSnaps.length} snapshots`;
         }
       });
       await Promise.all(workers);
 
-      // Assemble the HTML. All styling is inline so the file survives being
-      // moved to another machine or opened offline.
+      btn.textContent = 'Building workbook…';
+      const wb = new ExcelJS.Workbook();
+      wb.creator  = 'SecureVision';
+      wb.created  = new Date();
+      wb.subject  = 'Video analysis report';
+
+      // ── Summary sheet ─────────────────────────────
       const counts = summary.counts || {};
-      const generatedAt = new Date().toLocaleString();
-      const rowHtml = (row) => {
-        const time = fmtSecondsClock(row.first_s);
-        const dur  = row.duration_s != null ? `<span class="dur">visible ${row.duration_s}s</span>` : '';
-        const tags = (row.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('');
-        const img  = row.snap && dataUrls[row.snap]
-          ? `<img src="${dataUrls[row.snap]}" alt="">`
-          : `<div class="no-snap">no snapshot</div>`;
-        return `
-          <tr>
-            <td class="thumb">${img}</td>
-            <td>
-              <div class="title">${esc(row.title)}</div>
-              <div class="sub">${esc(row.subtitle || '')}</div>
-              <div class="tags">${tags}</div>
-            </td>
-            <td class="time">${time}<br>${dur}</td>
-          </tr>`;
-      };
-      const sectionHtml = (s) => `
-        <section>
-          <h2>${esc(s.title)} <span class="count">${s.rows.length}</span></h2>
-          <table>${s.rows.map(rowHtml).join('')}</table>
-        </section>`;
+      const sSum = wb.addWorksheet('Summary');
+      sSum.columns = [{ width: 26 }, { width: 24 }];
+      const titleRow = sSum.addRow(['Video analysis report']);
+      titleRow.font = { bold: true, size: 16 };
+      sSum.addRow(['Source', state.fileName || '(unknown)']);
+      sSum.addRow(['Generated', new Date().toLocaleString()]);
+      sSum.addRow([]);
+      const hdr = sSum.addRow(['Metric', 'Count']);
+      hdr.font = { bold: true };
+      hdr.eachCell(c => c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE5E7EB' } });
+      sSum.addRow(['Persons',          counts.persons          ?? 0]);
+      sSum.addRow(['Vehicles',         counts.vehicles         ?? 0]);
+      sSum.addRow(['Faces recognized', counts.faces_recognized ?? 0]);
+      sSum.addRow(['Plates read',      counts.plates_read      ?? 0]);
+      sSum.addRow(['Loitering events', counts.loitering_events ?? 0]);
+      sSum.addRow(['Fire / smoke',     counts.fire_events      ?? 0]);
 
-      const html = `<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<title>Analysis report — ${esc(state.fileName || 'video')}</title>
-<style>
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 32px; background: #0b0f16; color: #e5e7eb;
-         font-family: -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; }
-  h1 { margin: 0 0 4px; font-size: 22px; }
-  .meta { color: #94a3b8; font-size: 12px; margin-bottom: 24px; }
-  .counts { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 32px; }
-  .count { background: #131a26; border: 1px solid #1f2937; border-radius: 8px; padding: 14px; text-align: center; }
-  .count-value { font-size: 26px; font-weight: 700; }
-  .count-label { color: #94a3b8; font-size: 12px; margin-top: 4px; }
-  section { background: #131a26; border: 1px solid #1f2937; border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; page-break-inside: avoid; }
-  h2 { margin: 0 0 12px; font-size: 16px; display: flex; align-items: center; gap: 10px; }
-  h2 .count { background: #1f2937; color: #cbd5e1; font-size: 12px; padding: 2px 10px; border-radius: 999px; }
-  table { width: 100%; border-collapse: collapse; }
-  td { padding: 10px 8px; border-top: 1px solid #1f2937; vertical-align: middle; }
-  tr:first-child td { border-top: 0; }
-  td.thumb { width: 120px; }
-  td.thumb img { width: 100px; height: 60px; object-fit: cover; border-radius: 6px; display: block; }
-  td.thumb .no-snap { width: 100px; height: 60px; background: #1f2937; border-radius: 6px; color: #64748b; font-size: 11px; display: flex; align-items: center; justify-content: center; }
-  .title { font-weight: 600; margin-bottom: 2px; }
-  .sub { color: #94a3b8; font-size: 12px; margin-bottom: 6px; }
-  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
-  .tag { background: #1f2937; color: #cbd5e1; font-size: 11px; padding: 3px 8px; border-radius: 999px; }
-  td.time { width: 100px; text-align: right; color: #cbd5e1; font-variant-numeric: tabular-nums; }
-  td.time .dur { color: #94a3b8; font-size: 11px; }
-  @media print {
-    body { background: #fff; color: #111; padding: 16px; }
-    section, .count { background: #fff; border-color: #d1d5db; color: #111; }
-    .sub, .meta, td.time .dur { color: #4b5563; }
-    .tag, h2 .count { background: #e5e7eb; color: #111; }
-    td { border-color: #e5e7eb; }
-  }
-</style></head>
-<body>
-  <h1>Video analysis report</h1>
-  <div class="meta">
-    Source: ${esc(state.fileName || '(unknown)')}<br>
-    Generated: ${esc(generatedAt)}
-  </div>
-  <div class="counts">
-    <div class="count"><div class="count-value">${counts.persons ?? 0}</div><div class="count-label">Persons</div></div>
-    <div class="count"><div class="count-value">${counts.vehicles ?? 0}</div><div class="count-label">Vehicles</div></div>
-    <div class="count"><div class="count-value">${counts.faces_recognized ?? 0}</div><div class="count-label">Faces recognized</div></div>
-    <div class="count"><div class="count-value">${counts.plates_read ?? 0}</div><div class="count-label">Plates read</div></div>
-    <div class="count"><div class="count-value">${counts.loitering_events ?? 0}</div><div class="count-label">Loitering events</div></div>
-    <div class="count"><div class="count-value">${counts.fire_events ?? 0}</div><div class="count-label">Fire / smoke</div></div>
-  </div>
-  ${sections.map(sectionHtml).join('')}
-</body></html>`;
+      // ── Per-category sheets ────────────────────────
+      // Images in Excel float above cells rather than sitting inside them.
+      // ExcelJS's addImage takes a data range in { tl, br } (top-left,
+      // bottom-right) where col/row are zero-indexed fractional coordinates.
+      // To make the picture appear "inside" the screenshot column of a data
+      // row we anchor it to (col 0, row N) → (col 1, row N+1) which fills
+      // that one cell. Row height needs to accommodate the image height —
+      // Excel row heights are in points (1 pt ≈ 1.33 px), so a 60px image
+      // needs ~48 pt of row height for comfortable padding.
+      const IMG_W = 120, IMG_H = 68;
+      const ROW_H = 55;   // points — leaves a small margin around the image
+      const COL_A_W = 18; // Excel character units — roughly matches 120px
 
-      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      function buildSheet(name, headers, rows) {
+        if (!rows.length) return;
+        const sh = wb.addWorksheet(name);
+        sh.columns = headers.map((h, i) => ({
+          header: h.title, key: h.key,
+          width: i === 0 ? COL_A_W : (h.width || 18),
+        }));
+        sh.getRow(1).font = { bold: true };
+        sh.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE5E7EB' } };
+        sh.getRow(1).height = 22;
+        for (const r of rows) {
+          const excelRow = sh.addRow(r.values);
+          excelRow.height = ROW_H;
+          excelRow.alignment = { vertical: 'middle', wrapText: true };
+          if (r.snap && b64[r.snap]) {
+            const imgId = wb.addImage({ base64: b64[r.snap], extension: 'jpeg' });
+            // Anchor: cover cell A of this data row. `row` is zero-based
+            // in the anchor coordinate system — excelRow.number is 1-based,
+            // so subtract 1. Small inset (0.05) keeps the image off the
+            // gridlines so it doesn't look cramped.
+            sh.addImage(imgId, {
+              tl: { col: 0.05, row: excelRow.number - 1 + 0.05 },
+              ext: { width: IMG_W, height: IMG_H },
+              editAs: 'oneCell',
+            });
+          }
+        }
+        sh.views = [{ state: 'frozen', ySplit: 1 }];
+      }
+
+      buildSheet('Persons', [
+        { title: 'Screenshot',   key: 'snap' },
+        { title: 'Track',        key: 'track',      width: 14 },
+        { title: 'Recognized',   key: 'recognized', width: 22 },
+        { title: 'Face visible', key: 'face',       width: 14 },
+        { title: 'Loitering',    key: 'loit',       width: 12 },
+        { title: 'Tags',         key: 'tags',       width: 48 },
+        { title: 'First seen',   key: 'first',      width: 12 },
+        { title: 'Duration (s)', key: 'dur',        width: 14 },
+        { title: 'Frames',       key: 'frames',     width: 10 },
+        { title: 'Avg conf',     key: 'conf',       width: 10 },
+      ], persons);
+
+      buildSheet('Vehicles', [
+        { title: 'Screenshot',   key: 'snap' },
+        { title: 'Track',        key: 'track',   width: 14 },
+        { title: 'Vehicle type', key: 'type',    width: 16 },
+        { title: 'Plate',        key: 'plate',   width: 22 },
+        { title: 'Tags',         key: 'tags',    width: 42 },
+        { title: 'First seen',   key: 'first',   width: 12 },
+        { title: 'Duration (s)', key: 'dur',     width: 14 },
+        { title: 'Frames',       key: 'frames',  width: 10 },
+        { title: 'Avg conf',     key: 'conf',    width: 10 },
+      ], vehicles);
+
+      buildSheet('Faces recognized', [
+        { title: 'Screenshot', key: 'snap' },
+        { title: 'Name',       key: 'name',   width: 24 },
+        { title: 'Frames',     key: 'count',  width: 10 },
+        { title: 'First seen', key: 'first',  width: 12 },
+      ], faces);
+
+      buildSheet('Plates read', [
+        { title: 'Screenshot',   key: 'snap' },
+        { title: 'Plate',        key: 'plate',   width: 24 },
+        { title: 'Vehicle type', key: 'vtype',   width: 16 },
+        { title: 'Reads',        key: 'count',   width: 10 },
+        { title: 'First seen',   key: 'first',   width: 12 },
+      ], plates);
+
+      buildSheet('Loitering', [
+        { title: 'Screenshot',      key: 'snap' },
+        { title: 'Track',           key: 'track', width: 14 },
+        { title: 'Peak dwell (s)',  key: 'dwell', width: 16 },
+        { title: 'First flagged',   key: 'first', width: 14 },
+      ], loitering);
+
+      buildSheet('Fire / smoke', [
+        { title: 'Screenshot', key: 'snap' },
+        { title: 'Event',      key: 'title', width: 14 },
+        { title: 'First seen', key: 'first', width: 12 },
+      ], fire);
+
+      // ── Write and download ────────────────────────
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       const stem = (state.fileName || 'video').replace(/\.[^.]+$/, '');
       a.href = url;
-      a.download = `${stem}-report.html`;
+      a.download = `${stem}-report.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      // Give the browser a tick to start the download before revoking.
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err?.message || 'Failed to build report.');
     } finally {
       btn.disabled = false;
       btn.textContent = orig;
