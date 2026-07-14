@@ -2405,6 +2405,7 @@ window.analyzeModule = (() => {
   const $videoWrap = () => document.getElementById('analyze-video-wrap');
   const $video     = () => document.getElementById('analyze-video');
   const $download  = () => document.getElementById('analyze-download');
+  const $report    = () => document.getElementById('analyze-report');
 
   function selectFile(f) {
     if (!f) return;
@@ -2422,6 +2423,7 @@ window.analyzeModule = (() => {
   function reset() {
     state.jobId = null;
     state.file = null;
+    state.summary = null;
     $file().value = '';
     $selected().style.display = 'none';
     $selected().innerHTML = '';
@@ -2556,6 +2558,10 @@ window.analyzeModule = (() => {
     $download().download = 'annotated.mp4';
     $submit().textContent = 'Analyze';
     $submit().disabled = !state.file;
+    // Stash the summary so the "Download report" button can build a
+    // self-contained HTML document without re-requesting the data.
+    state.summary  = summary;
+    state.fileName = state.file?.name || 'video';
     renderSummary(summary);
   }
 
@@ -2597,9 +2603,10 @@ window.analyzeModule = (() => {
   };
 
   function buildIncidentRow(item) {
-    // Table row: Snapshot | Subject | Detail | Time. The tab header already
-    // tells the user which category this row belongs to, so no need to repeat
-    // the event type in every row.
+    // Generic row: Snapshot | Subject | Detail | Time. `item.tags` is an
+    // optional array of small colored pills (e.g. "Front-facing", "Recognized",
+    // "Plate: ABC1234") that render inline in the Detail column beneath the
+    // subtitle. Duration + timestamps go in the Time column.
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="analyze-row-thumb"></td>
@@ -2619,13 +2626,40 @@ window.analyzeModule = (() => {
       tr.querySelector('.analyze-row-thumb').textContent = '—';
     }
     tr.querySelector('.analyze-row-title').textContent = item.title;
-    tr.querySelector('.analyze-row-sub').textContent = item.subtitle || '';
+
+    const detailCell = tr.querySelector('.analyze-row-sub');
+    if (item.subtitle) {
+      const sub = document.createElement('div');
+      sub.textContent = item.subtitle;
+      detailCell.appendChild(sub);
+    }
+    if (item.tags && item.tags.length) {
+      const tagsWrap = document.createElement('div');
+      tagsWrap.className = 'analyze-row-tags';
+      for (const t of item.tags) {
+        const pill = document.createElement('span');
+        pill.className = `analyze-row-tag ${t.cls || ''}`;
+        pill.textContent = t.label;
+        tagsWrap.appendChild(pill);
+      }
+      detailCell.appendChild(tagsWrap);
+    }
+
+    // Time column shows the click-to-seek timestamp plus, if provided, a
+    // second smaller line with duration ("visible 4.2s").
+    const timeCell = tr.querySelector('.analyze-row-time');
     const timeBtn = document.createElement('button');
     timeBtn.className = 'analyze-time-btn';
     timeBtn.textContent = fmtSecondsClock(item.first_s);
     timeBtn.title = 'Jump to this moment in the video';
     timeBtn.addEventListener('click', () => seekVideoTo(item.first_s));
-    tr.querySelector('.analyze-row-time').appendChild(timeBtn);
+    timeCell.appendChild(timeBtn);
+    if (item.duration_s != null) {
+      const durSpan = document.createElement('div');
+      durSpan.className = 'analyze-row-duration';
+      durSpan.textContent = `visible ${item.duration_s.toFixed(1)}s`;
+      timeCell.appendChild(durSpan);
+    }
     return tr;
   }
 
@@ -2685,17 +2719,61 @@ window.analyzeModule = (() => {
       countsEl.appendChild(el);
     }
 
-    // Build the per-tab row sets. Row objects are the same shape as
-    // buildIncidentRow expects: { snap, title, subtitle, first_s }.
+    // Build the per-tab row sets. Row objects share the buildIncidentRow
+    // shape { snap, title, subtitle, first_s, duration_s?, tags? }. Tags are
+    // small colored pills shown in the Detail column — used for boolean or
+    // categorical info (face visible, recognized name, etc.).
     const tabRows = {
-      persons: (summary.persons || []).map(p => ({
-        snap: p.snap, title: `Track #${p.trackId}`, subtitle: '',
-        first_s: p.first_s,
-      })),
-      vehicles: (summary.vehicles || []).map(v => ({
-        snap: v.snap, title: `Track #${v.trackId}`,
-        subtitle: v.vehicleType || 'vehicle', first_s: v.first_s,
-      })),
+      persons: (summary.persons || []).map(p => {
+        const tags = [];
+        if (p.recognized_name) {
+          tags.push({ label: `Recognized: ${p.recognized_name}`, cls: 'tag-face' });
+        }
+        // Honest labeling: `face_seen` means MediaPipe fired inside this
+        // track at least once (either on the downscaled frame or the full-
+        // res person-crop fallback). If it never fired we don't actually
+        // know whether the person was back-facing, occluded, too small, or
+        // at a bad angle — say what we know, not what we guess.
+        tags.push(p.face_seen
+          ? { label: 'Face visible', cls: 'tag-face' }
+          : { label: 'Face not detected', cls: 'tag-muted' });
+        // Loitering — analyzer sets this on any canonical whose merged
+        // original track IDs crossed the dwell threshold. Show the peak
+        // dwell time so the pill is more informative than a bare flag.
+        if (p.loitering) {
+          const dwell = p.peak_dwell_s ? ` (${Math.round(p.peak_dwell_s)}s)` : '';
+          tags.push({ label: `Loitering${dwell}`, cls: 'tag-plate' });
+        }
+        // Show when the analyzer stitched multiple ByteTrack IDs into one
+        // canonical person — helps the user understand why a "track" spans
+        // a longer window than any single ID would.
+        if (p.segments && p.segments > 1) {
+          tags.push({ label: `Stitched from ${p.segments} segments`, cls: 'tag-muted' });
+        }
+        return {
+          snap: p.snap,
+          title: `Track #${p.trackId}`,
+          subtitle: `${p.frame_count} frames · avg conf ${Math.round((p.avg_conf || 0) * 100)}%`,
+          first_s: p.first_s,
+          duration_s: p.duration_s,
+          tags,
+        };
+      }),
+      vehicles: (summary.vehicles || []).map(v => {
+        const tags = [{ label: (v.vehicleType || 'vehicle').toUpperCase(), cls: 'tag-vehicle' }];
+        if (v.plate) tags.push({ label: `Plate: ${v.plate}`, cls: 'tag-plate' });
+        if (v.segments && v.segments > 1) {
+          tags.push({ label: `Stitched from ${v.segments} segments`, cls: 'tag-muted' });
+        }
+        return {
+          snap: v.snap,
+          title: `Track #${v.trackId}`,
+          subtitle: `${v.frame_count} frames · avg conf ${Math.round((v.avg_conf || 0) * 100)}%`,
+          first_s: v.first_s,
+          duration_s: v.duration_s,
+          tags,
+        };
+      }),
       faces: (summary.faces || []).map(f => ({
         snap: f.snap, title: f.name,
         subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
@@ -2758,6 +2836,219 @@ window.analyzeModule = (() => {
 
   // Wire event handlers once — the page may be revisited many times but the
   // DOM elements are static, so single listeners are enough.
+  // Turn a backend snapshot URL into a data: URL so it can be embedded in
+  // the self-contained HTML report — the file needs to be readable after
+  // the user's session ends and moves off-line, so external URLs (which
+  // would 401 without a token, and 404 after job cleanup) won't do.
+  async function snapAsDataUrl(fname) {
+    const url = snapUrl(fname);
+    if (!url) return null;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      return await new Promise((resolve) => {
+        const fr = new FileReader();
+        fr.onload  = () => resolve(fr.result);
+        fr.onerror = () => resolve(null);
+        fr.readAsDataURL(blob);
+      });
+    } catch (_) { return null; }
+  }
+
+  // Escape a string for safe interpolation into HTML text/attribute contexts.
+  // The plate strings can contain Bangla; user filenames can contain anything.
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  async function downloadReport() {
+    const summary = state.summary;
+    if (!summary) return;
+    const btn = $report();
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Preparing…';
+    try {
+      // Reuse the tab row-building logic from renderSummary so the report
+      // stays in lockstep with what the UI displays. We inline it here
+      // (rather than exporting) because the row shape is analyze-only and
+      // this way the report generator has no other dependencies.
+      const cat = (rows, title) => ({ title, rows });
+      const persons = (summary.persons || []).map(p => {
+        const tags = [];
+        if (p.recognized_name) tags.push(`Recognized: ${p.recognized_name}`);
+        tags.push(p.face_seen ? 'Face visible' : 'Face not detected');
+        if (p.loitering) {
+          const d = p.peak_dwell_s ? ` (${Math.round(p.peak_dwell_s)}s)` : '';
+          tags.push(`Loitering${d}`);
+        }
+        if (p.segments > 1) tags.push(`Stitched from ${p.segments} segments`);
+        return {
+          snap: p.snap, title: `Track #${p.trackId}`,
+          subtitle: `${p.frame_count} frames · avg conf ${Math.round((p.avg_conf || 0) * 100)}%`,
+          first_s: p.first_s, duration_s: p.duration_s, tags,
+        };
+      });
+      const vehicles = (summary.vehicles || []).map(v => {
+        const tags = [(v.vehicleType || 'vehicle').toUpperCase()];
+        if (v.plate) tags.push(`Plate: ${v.plate}`);
+        if (v.segments > 1) tags.push(`Stitched from ${v.segments} segments`);
+        return {
+          snap: v.snap, title: `Track #${v.trackId}`,
+          subtitle: `${v.frame_count} frames · avg conf ${Math.round((v.avg_conf || 0) * 100)}%`,
+          first_s: v.first_s, duration_s: v.duration_s, tags,
+        };
+      });
+      const faces = (summary.faces || []).map(f => ({
+        snap: f.snap, title: f.name,
+        subtitle: `${f.count} frame${f.count === 1 ? '' : 's'}`,
+        first_s: f.first_s, tags: [],
+      }));
+      const plates = (summary.plates || []).map(p => ({
+        snap: p.snap, title: p.plate,
+        subtitle: p.vehicleType || 'vehicle', first_s: p.first_s, tags: [],
+      }));
+      const loitering = (summary.loitering || []).map(l => ({
+        snap: l.snap, title: `Track #${l.trackId}`,
+        subtitle: `Peak dwell ${l.peak_dwell_s}s`, first_s: l.first_s, tags: [],
+      }));
+      const fire = (summary.fire || []).map((f, i) => ({
+        snap: f.snap, title: `Event ${i + 1}`, subtitle: '',
+        first_s: f.first_s, tags: [],
+      }));
+      const sections = [
+        cat(persons,   'Persons'),
+        cat(vehicles,  'Vehicles'),
+        cat(faces,     'Faces recognized'),
+        cat(plates,    'Plates read'),
+        cat(loitering, 'Loitering events'),
+        cat(fire,      'Fire / smoke'),
+      ].filter(s => s.rows.length > 0);
+
+      // Fetch every unique snapshot once and cache the data: URL. The rows
+      // often reference the same file (e.g., a "loitering" row and the
+      // corresponding "persons" row share a snap) so this de-dupes work.
+      const uniqueSnaps = [...new Set(
+        sections.flatMap(s => s.rows.map(r => r.snap).filter(Boolean))
+      )];
+      btn.textContent = `Preparing… 0/${uniqueSnaps.length} snapshots`;
+      const dataUrls = {};
+      let done = 0;
+      // Fire off in parallel but with a soft cap (8) so slow networks don't
+      // choke — Promise.all with unbounded concurrency can DoS the backend.
+      const queue = uniqueSnaps.slice();
+      const workers = new Array(Math.min(8, queue.length)).fill(0).map(async () => {
+        while (queue.length) {
+          const s = queue.shift();
+          dataUrls[s] = await snapAsDataUrl(s);
+          done += 1;
+          btn.textContent = `Preparing… ${done}/${uniqueSnaps.length} snapshots`;
+        }
+      });
+      await Promise.all(workers);
+
+      // Assemble the HTML. All styling is inline so the file survives being
+      // moved to another machine or opened offline.
+      const counts = summary.counts || {};
+      const generatedAt = new Date().toLocaleString();
+      const rowHtml = (row) => {
+        const time = fmtSecondsClock(row.first_s);
+        const dur  = row.duration_s != null ? `<span class="dur">visible ${row.duration_s}s</span>` : '';
+        const tags = (row.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+        const img  = row.snap && dataUrls[row.snap]
+          ? `<img src="${dataUrls[row.snap]}" alt="">`
+          : `<div class="no-snap">no snapshot</div>`;
+        return `
+          <tr>
+            <td class="thumb">${img}</td>
+            <td>
+              <div class="title">${esc(row.title)}</div>
+              <div class="sub">${esc(row.subtitle || '')}</div>
+              <div class="tags">${tags}</div>
+            </td>
+            <td class="time">${time}<br>${dur}</td>
+          </tr>`;
+      };
+      const sectionHtml = (s) => `
+        <section>
+          <h2>${esc(s.title)} <span class="count">${s.rows.length}</span></h2>
+          <table>${s.rows.map(rowHtml).join('')}</table>
+        </section>`;
+
+      const html = `<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Analysis report — ${esc(state.fileName || 'video')}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 32px; background: #0b0f16; color: #e5e7eb;
+         font-family: -apple-system, Segoe UI, Roboto, sans-serif; font-size: 14px; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .meta { color: #94a3b8; font-size: 12px; margin-bottom: 24px; }
+  .counts { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 32px; }
+  .count { background: #131a26; border: 1px solid #1f2937; border-radius: 8px; padding: 14px; text-align: center; }
+  .count-value { font-size: 26px; font-weight: 700; }
+  .count-label { color: #94a3b8; font-size: 12px; margin-top: 4px; }
+  section { background: #131a26; border: 1px solid #1f2937; border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; page-break-inside: avoid; }
+  h2 { margin: 0 0 12px; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+  h2 .count { background: #1f2937; color: #cbd5e1; font-size: 12px; padding: 2px 10px; border-radius: 999px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 10px 8px; border-top: 1px solid #1f2937; vertical-align: middle; }
+  tr:first-child td { border-top: 0; }
+  td.thumb { width: 120px; }
+  td.thumb img { width: 100px; height: 60px; object-fit: cover; border-radius: 6px; display: block; }
+  td.thumb .no-snap { width: 100px; height: 60px; background: #1f2937; border-radius: 6px; color: #64748b; font-size: 11px; display: flex; align-items: center; justify-content: center; }
+  .title { font-weight: 600; margin-bottom: 2px; }
+  .sub { color: #94a3b8; font-size: 12px; margin-bottom: 6px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { background: #1f2937; color: #cbd5e1; font-size: 11px; padding: 3px 8px; border-radius: 999px; }
+  td.time { width: 100px; text-align: right; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+  td.time .dur { color: #94a3b8; font-size: 11px; }
+  @media print {
+    body { background: #fff; color: #111; padding: 16px; }
+    section, .count { background: #fff; border-color: #d1d5db; color: #111; }
+    .sub, .meta, td.time .dur { color: #4b5563; }
+    .tag, h2 .count { background: #e5e7eb; color: #111; }
+    td { border-color: #e5e7eb; }
+  }
+</style></head>
+<body>
+  <h1>Video analysis report</h1>
+  <div class="meta">
+    Source: ${esc(state.fileName || '(unknown)')}<br>
+    Generated: ${esc(generatedAt)}
+  </div>
+  <div class="counts">
+    <div class="count"><div class="count-value">${counts.persons ?? 0}</div><div class="count-label">Persons</div></div>
+    <div class="count"><div class="count-value">${counts.vehicles ?? 0}</div><div class="count-label">Vehicles</div></div>
+    <div class="count"><div class="count-value">${counts.faces_recognized ?? 0}</div><div class="count-label">Faces recognized</div></div>
+    <div class="count"><div class="count-value">${counts.plates_read ?? 0}</div><div class="count-label">Plates read</div></div>
+    <div class="count"><div class="count-value">${counts.loitering_events ?? 0}</div><div class="count-label">Loitering events</div></div>
+    <div class="count"><div class="count-value">${counts.fire_events ?? 0}</div><div class="count-label">Fire / smoke</div></div>
+  </div>
+  ${sections.map(sectionHtml).join('')}
+</body></html>`;
+
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stem = (state.fileName || 'video').replace(/\.[^.]+$/, '');
+      a.href = url;
+      a.download = `${stem}-report.html`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Give the browser a tick to start the download before revoking.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  }
+
   function wire() {
     const drop = $drop();
     if (!drop || drop.dataset.wired) return;
@@ -2774,6 +3065,7 @@ window.analyzeModule = (() => {
     $file().addEventListener('change', (e) => selectFile(e.target.files?.[0]));
     $submit().addEventListener('click', submit);
     document.getElementById('analyze-new').addEventListener('click', reset);
+    $report().addEventListener('click', downloadReport);
   }
 
   return { wire, reset, onProgress };

@@ -226,25 +226,82 @@ def process_video(input_path, output_path, enrollment_dir=None,
         '_loitering_seen': set(),
     }
 
-    def save_keyframe(slug, frame_bgr, incidents=None, detections=None):
-        """Persist a burned-in JPEG for the summary rail. Returns basename or None."""
+    def save_keyframe(slug, frame_bgr, bbox_norm=None, pad=0.25, min_w=320):
+        """Persist a JPEG for the summary rail. Returns basename or None.
+
+        When `bbox_norm` is None, saves a downscaled full-frame thumbnail.
+        When provided (as (x, y, w, h) in 0..1 relative coords), crops around
+        that box with padding to produce a "focused" portrait of the subject —
+        useful for showing one person / one vehicle out of a crowded scene.
+        `pad` is a fraction of the bbox width/height added on each side.
+        `min_w` is a floor for output width — tiny far-away subjects get
+        upscaled so they're still readable in the summary table.
+        """
         try:
             ts_ms = int(time.time() * 1000)
-            # Slugs are trusted (we build them) but sanitize anyway.
             safe = ''.join(c for c in slug if c.isalnum() or c in '-_')[:40] or 'k'
             fname = f'{safe}_{ts_ms}.jpg'
             path = os.path.join(snap_dir, fname)
-            # Downscale to 480px wide for a fast-loading thumb.
-            img = frame_bgr.copy()
+            img = frame_bgr
+            if bbox_norm is not None:
+                h, w = img.shape[:2]
+                x, y, bw, bh = bbox_norm
+                px = bw * pad
+                py = bh * pad
+                x0 = max(0, int((x - px) * w))
+                y0 = max(0, int((y - py) * h))
+                x1 = min(w, int((x + bw + px) * w))
+                y1 = min(h, int((y + bh + py) * h))
+                if x1 > x0 and y1 > y0:
+                    img = img[y0:y1, x0:x1]
+                else:
+                    img = frame_bgr
+            img = img.copy()
             h, w = img.shape[:2]
+            # Downscale wide crops; upscale tiny far-subject crops so the
+            # summary thumb is legible.
             if w > 480:
                 scale = 480.0 / w
                 img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+            elif w < min_w and w > 0:
+                scale = min_w / w
+                img = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 82])
             return fname
         except Exception as ex:
             print(f'  [warn] keyframe save failed: {ex}', file=sys.stderr)
             return None
+
+    # ── Track-stitching helpers ────────────────────────────────
+    # ByteTrack reissues fresh IDs when it briefly loses a subject (a
+    # motorcycle passes behind a car, a person walks under low light for a
+    # few frames, YOLO's confidence dips). Without correction, one person
+    # who was on-screen for 30s can show up as five duplicate rows. The
+    # after-the-fact stitcher below merges chronologically-adjacent tracks
+    # whose torso-region color histograms match — colour is much more
+    # discriminating than pure spatial proximity for the "two motorcyclists
+    # in similar spots" case. We store a running per-track reference
+    # histogram plus first/last box so the merge check has everything it
+    # needs.
+    def compute_ref_hist(frame_bgr, x0n, y0n, x1n, y1n):
+        H_, W_ = frame_bgr.shape[:2]
+        x0 = max(0, int(x0n * W_)); y0 = max(0, int(y0n * H_))
+        x1 = min(W_, int(x1n * W_)); y1 = min(H_, int(y1n * H_))
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            return None
+        # Central crop — for persons this biases toward the torso (drops
+        # head + legs), for vehicles it just trims the box edges where the
+        # background bleeds in.
+        cw, ch = x1 - x0, y1 - y0
+        cx0 = x0 + int(cw * 0.20); cx1 = x0 + int(cw * 0.80)
+        cy0 = y0 + int(ch * 0.15); cy1 = y0 + int(ch * 0.65)
+        crop = frame_bgr[cy0:cy1, cx0:cx1]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        return hist
 
     # Models are loaded and everything is warm — flip the UI out of the
     # "Loading models…" state so the progress bar can start moving.
@@ -328,7 +385,7 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         })
                         entry['count'] += 1
                         if entry['snap'] is None and not any(p[1] is entry for p in pending_keyframes):
-                            pending_keyframes.append((f'face-{name}', entry, 'snap'))
+                            pending_keyframes.append((f'face-{name}', entry, 'snap', None))
                 for bucket in list(name_streaks.keys()):
                     if bucket not in seen_buckets:
                         del name_streaks[bucket]
@@ -369,13 +426,51 @@ def process_video(input_path, output_path, enrollment_dir=None,
                                'confidence': conf, 'label': 'person'}
                         if tid is not None:
                             det['trackId'] = tid
-                            # Save one keyframe per unique person track_id
-                            # (the first frame we see them in). Boxes will be
-                            # burned onto `out` before the queue flushes.
-                            if tid not in summary['persons']:
-                                entry = {'trackId': tid, 'first_s': round(now, 1), 'snap': None}
-                                summary['persons'][tid] = entry
-                                pending_keyframes.append((f'person-{tid}', entry, 'snap'))
+                            # Aggregate per-track metadata: first/last seen,
+                            # dwell duration, average YOLO confidence, whether
+                            # a face was ever visible (front-facing heuristic),
+                            # and the FaceNet name if one was ever confirmed.
+                            # A focused crop is written on first sighting so
+                            # the summary shows a portrait of just this person.
+                            pentry = summary['persons'].get(tid)
+                            if pentry is None:
+                                pentry = {
+                                    'trackId': tid,
+                                    'first_s': round(now, 1),
+                                    'last_s':  round(now, 1),
+                                    'frame_count': 1,
+                                    'face_seen': False,
+                                    'recognized_name': None,
+                                    'avg_conf': conf,
+                                    '_sum_conf': conf,
+                                    'snap': None,
+                                    'segments': 1,
+                                    '_first_box': (bx[0], bx[1], bw, bh),
+                                    '_last_box':  (bx[0], bx[1], bw, bh),
+                                    '_ref_hist':  compute_ref_hist(frame, bx[0], bx[1], bx[2], bx[3]),
+                                }
+                                summary['persons'][tid] = pentry
+                                # Focused crop: pass this person's normalized
+                                # bbox so save_keyframe crops around them.
+                                pending_keyframes.append(
+                                    (f'person-{tid}', pentry, 'snap',
+                                     (bx[0], bx[1], bw, bh)))
+                            else:
+                                pentry['last_s'] = round(now, 1)
+                                pentry['frame_count'] += 1
+                                pentry['_sum_conf'] += conf
+                                pentry['avg_conf'] = pentry['_sum_conf'] / pentry['frame_count']
+                                pentry['_last_box'] = (bx[0], bx[1], bw, bh)
+                                # Refresh appearance histogram periodically —
+                                # lighting/pose shifts otherwise leave us with
+                                # a stale reference from frame 1.
+                                if pentry['frame_count'] % 5 == 0:
+                                    nh = compute_ref_hist(frame, bx[0], bx[1], bx[2], bx[3])
+                                    if nh is not None:
+                                        if pentry['_ref_hist'] is None:
+                                            pentry['_ref_hist'] = nh
+                                        else:
+                                            pentry['_ref_hist'] = pentry['_ref_hist'] * 0.7 + nh * 0.3
                         detections.append(det)
                         if tid is not None:
                             st = loitering_state.get(tid)
@@ -423,11 +518,41 @@ def process_video(input_path, output_path, enrollment_dir=None,
                     elif label in detect.VEHICLE_CLASSES:
                         bw = bx[2] - bx[0]; bh = bx[3] - bx[1]
                         if bw * bh < 0.01: continue
-                        if tid is not None and tid not in summary['vehicles']:
-                            entry = {'trackId': tid, 'first_s': round(now, 1),
-                                     'vehicleType': label, 'snap': None}
-                            summary['vehicles'][tid] = entry
-                            pending_keyframes.append((f'vehicle-{tid}', entry, 'snap'))
+                        if tid is not None:
+                            ventry = summary['vehicles'].get(tid)
+                            if ventry is None:
+                                ventry = {
+                                    'trackId': tid,
+                                    'first_s': round(now, 1),
+                                    'last_s':  round(now, 1),
+                                    'frame_count': 1,
+                                    'vehicleType': label,
+                                    'plate': None,   # filled by plate pipeline when confirmed
+                                    'avg_conf': conf,
+                                    '_sum_conf': conf,
+                                    'snap': None,
+                                    'segments': 1,
+                                    '_first_box': (bx[0], bx[1], bw, bh),
+                                    '_last_box':  (bx[0], bx[1], bw, bh),
+                                    '_ref_hist':  compute_ref_hist(frame, bx[0], bx[1], bx[2], bx[3]),
+                                }
+                                summary['vehicles'][tid] = ventry
+                                pending_keyframes.append(
+                                    (f'vehicle-{tid}', ventry, 'snap',
+                                     (bx[0], bx[1], bw, bh)))
+                            else:
+                                ventry['last_s'] = round(now, 1)
+                                ventry['frame_count'] += 1
+                                ventry['_sum_conf'] += conf
+                                ventry['avg_conf'] = ventry['_sum_conf'] / ventry['frame_count']
+                                ventry['_last_box'] = (bx[0], bx[1], bw, bh)
+                                if ventry['frame_count'] % 5 == 0:
+                                    nh = compute_ref_hist(frame, bx[0], bx[1], bx[2], bx[3])
+                                    if nh is not None:
+                                        if ventry['_ref_hist'] is None:
+                                            ventry['_ref_hist'] = nh
+                                        else:
+                                            ventry['_ref_hist'] = ventry['_ref_hist'] * 0.7 + nh * 0.3
                         detections.append({'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
                                            'confidence': conf, 'label': 'vehicle',
                                            'vehicleType': label,
@@ -439,6 +564,88 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         incidents.append({'type': 'fire', 'confidence': conf, 'box': bx})
         except Exception as ex:
             print(f'  [warn] YOLO: {ex}', file=sys.stderr)
+
+        # 2.5. Cross-link this frame's face detections to their containing
+        # person tracks. If a face center falls inside a person box, we mark
+        # that track's `face_seen=True` (front-facing at least once) and, if
+        # the face was recognized by FaceNet, attach the name to the person
+        # track so the summary can show "recognized as: <name>" per person.
+        person_dets = []
+        try:
+            face_dets = [d for d in detections if d.get('label') == 'face']
+            person_dets = [d for d in detections
+                           if d.get('label') == 'person' and d.get('trackId') is not None]
+            for fd in face_dets:
+                fcx = fd['x'] + fd['w'] / 2
+                fcy = fd['y'] + fd['h'] / 2
+                for pd in person_dets:
+                    if (pd['x'] <= fcx <= pd['x'] + pd['w']
+                        and pd['y'] <= fcy <= pd['y'] + pd['h']):
+                        pentry = summary['persons'].get(pd['trackId'])
+                        if pentry is not None:
+                            pentry['face_seen'] = True
+                            if fd.get('name'):
+                                pentry['recognized_name'] = fd['name']
+                        break
+        except Exception as ex:
+            print(f'  [warn] face-person link: {ex}', file=sys.stderr)
+
+        # 2.6. Full-resolution face-crop fallback. MediaPipe on the 0.5x-
+        # downscaled frame regularly misses small/angled faces that are
+        # perfectly visible when you crop the person out of the *source*
+        # frame. This second pass runs the same detector on each person
+        # crop at native resolution, but only for tracks that haven't yet
+        # had a face confirmed, and throttled to every third frame per
+        # track so we don't multiply CPU cost by (n_persons × n_frames).
+        try:
+            H_frame, W_frame = frame.shape[:2]
+            for pd in person_dets:
+                pentry = summary['persons'].get(pd['trackId'])
+                if pentry is None or pentry.get('face_seen'):
+                    continue
+                if frame_idx - pentry.get('_face_check_frame', -100) < 3:
+                    continue
+                pentry['_face_check_frame'] = frame_idx
+                # Expand the crop by 10% on each side — YOLO person boxes
+                # often clip the top of the head where the face lives.
+                pad_x = pd['w'] * 0.10
+                pad_y = pd['h'] * 0.10
+                px0 = max(0, int((pd['x'] - pad_x) * W_frame))
+                py0 = max(0, int((pd['y'] - pad_y) * H_frame))
+                px1 = min(W_frame, int((pd['x'] + pd['w'] + pad_x) * W_frame))
+                py1 = min(H_frame, int((pd['y'] + pd['h'] + pad_y) * H_frame))
+                if px1 - px0 < 40 or py1 - py0 < 40:
+                    continue
+                crop = frame[py0:py1, px0:px1]
+                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                crop_mp  = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+                with detect.face_detector_lock:
+                    cres = detect.shared_face_detector.detect(crop_mp)
+                if cres.detections:
+                    pentry['face_seen'] = True
+                    # Best-effort: also try FaceNet recognition on the crop
+                    # so we can name the person even when the primary pass
+                    # missed the face entirely.
+                    if rec is not None and pentry.get('recognized_name') is None:
+                        with rec.lock:
+                            centroids = dict(rec.centroids) if rec.ready else None
+                        if centroids:
+                            fd = cres.detections[0].bounding_box
+                            fx = max(0, fd.origin_x); fy = max(0, fd.origin_y)
+                            fw = min(fd.width,  crop.shape[1] - fx)
+                            fh = min(fd.height, crop.shape[0] - fy)
+                            if fw > 0 and fh > 0:
+                                emb = detect.embed_face(crop[fy:fy+fh, fx:fx+fw])
+                                if emb is not None:
+                                    best_n, best_s = None, -1.0
+                                    for n, c in centroids.items():
+                                        s = float(np.dot(emb, c))
+                                        if s > best_s:
+                                            best_s, best_n = s, n
+                                    if best_s >= detect.COSINE_THRESHOLD:
+                                        pentry['recognized_name'] = best_n
+        except Exception as ex:
+            print(f'  [warn] person-crop face check: {ex}', file=sys.stderr)
 
         # 3. Loitering resolution — ONLY for tracks visible this frame.
         # Orphan entries stay in the map (bounded by LOITERING_TRACK_TTL_S) so
@@ -477,7 +684,7 @@ def process_video(input_path, output_path, enrollment_dir=None,
                     'snap': None,
                 }
                 summary['loitering'].append(new_entry)
-                pending_keyframes.append((f'loit-{tid}', new_entry, 'snap'))
+                pending_keyframes.append((f'loit-{tid}', new_entry, 'snap', None))
             else:
                 for e in summary['loitering']:
                     if e['trackId'] == tid and dwell > e['peak_dwell_s']:
@@ -528,7 +735,12 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         })
                         entry['count'] += 1
                         if entry['snap'] is None and not any(p[1] is entry for p in pending_keyframes):
-                            pending_keyframes.append((f'plate-{tid}', entry, 'snap'))
+                            pending_keyframes.append((f'plate-{tid}', entry, 'snap', None))
+                        # Attach the plate string to the parent vehicle track
+                        # so the Vehicles tab shows "recognized plate: X".
+                        vent = summary['vehicles'].get(tid)
+                        if vent is not None:
+                            vent['plate'] = winner[0]
                 # Show the plate string on the box as soon as OCR reads it —
                 # confirmation (2+ agreeing reads) still gates the summary rail
                 # and incident entry, but the label should reflect what the
@@ -599,7 +811,7 @@ def process_video(input_path, output_path, enrollment_dir=None,
             if new_event:
                 new_fire = {'first_s': round(now, 1), 'snap': None}
                 summary['fire'].append(new_fire)
-                pending_keyframes.append((f'fire-{frame_idx}', new_fire, 'snap'))
+                pending_keyframes.append((f'fire-{frame_idx}', new_fire, 'snap', None))
 
         # ── Draw on the full-res output frame ─────────────────
         H, W = frame.shape[:2]
@@ -655,8 +867,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
                     (255, 255, 255), 1, cv2.LINE_AA)
 
         # Flush any keyframe writes now that boxes are burned onto `out`.
-        for slug, target, key in pending_keyframes:
-            target[key] = save_keyframe(slug, out)
+        # 4th tuple element (bbox_norm or None) drives whether the save is a
+        # focused crop (subject-only) or a downscaled full frame.
+        for slug, target, key, bbox in pending_keyframes:
+            target[key] = save_keyframe(slug, out, bbox_norm=bbox)
 
         writer.write(out)
 
@@ -703,8 +917,115 @@ def process_video(input_path, output_path, enrollment_dir=None,
     # `snap_dir` sits next to the output MP4 in the analyze_jobs job folder;
     # the backend exposes files under it via /analyze-video/:id/snapshot/:file.
     # Sort persons + vehicles by first-seen time so tabs read chronologically.
-    persons_list  = sorted(summary['persons'].values(),  key=lambda e: e['first_s'])
-    vehicles_list = sorted(summary['vehicles'].values(), key=lambda e: e['first_s'])
+    # Also compute derived fields (duration) and drop the internal running
+    # sum used to average confidence so it doesn't leak into the JSON.
+    def stitch_tracks(entries, max_gap_s=5.0, max_dist=0.15,
+                      max_size_ratio=1.6, hist_thresh=0.50):
+        """Merge track pairs that look like the same subject.
+
+        Greedy left-to-right sweep. A new track can merge into an earlier
+        canonical if ALL of:
+          - time gap between predecessor.last_s and successor.first_s ≤ max_gap_s
+          - center-to-center distance ≤ max_dist (normalized 0..1)
+          - box areas within max_size_ratio of each other
+          - torso HSV histogram correlation ≥ hist_thresh (or, if either
+            histogram is missing, a *tighter* spatial match is required)
+
+        All four gates must pass. This is intentionally conservative —
+        wrong merges lie about who was there; missed merges just leave a
+        duplicate row, which is the lesser evil.
+        """
+        ordered = sorted(entries.values(), key=lambda e: e['first_s'])
+        canonicals = []
+        for e in ordered:
+            best = None
+            for c in canonicals:
+                gap = e['first_s'] - c['last_s']
+                if gap < 0 or gap > max_gap_s:
+                    continue
+                fb, nb = c.get('_last_box'), e.get('_first_box')
+                if fb is None or nb is None:
+                    continue
+                cx1, cy1 = fb[0] + fb[2] / 2, fb[1] + fb[3] / 2
+                cx2, cy2 = nb[0] + nb[2] / 2, nb[1] + nb[3] / 2
+                dist = ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
+                if dist > max_dist:
+                    continue
+                a1, a2 = fb[2] * fb[3], nb[2] * nb[3]
+                if a1 <= 0 or a2 <= 0:
+                    continue
+                if max(a1, a2) / min(a1, a2) > max_size_ratio:
+                    continue
+                h1, h2 = c.get('_ref_hist'), e.get('_ref_hist')
+                if h1 is not None and h2 is not None:
+                    sim = float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+                    if sim < hist_thresh:
+                        continue
+                else:
+                    # No colour signal — require a tighter spatial match.
+                    if dist > max_dist * 0.6:
+                        continue
+                    sim = 0.0
+                score = -dist + sim
+                if best is None or score > best[0]:
+                    best = (score, c)
+            if best is not None:
+                c = best[1]
+                c['last_s'] = max(c['last_s'], e['last_s'])
+                c['frame_count'] += e['frame_count']
+                c['_sum_conf'] = c.get('_sum_conf', 0) + e.get('_sum_conf', 0)
+                c['avg_conf'] = c['_sum_conf'] / max(1, c['frame_count'])
+                c['face_seen'] = c.get('face_seen') or e.get('face_seen')
+                if not c.get('recognized_name') and e.get('recognized_name'):
+                    c['recognized_name'] = e['recognized_name']
+                if not c.get('plate') and e.get('plate'):
+                    c['plate'] = e['plate']
+                if e.get('_last_box') is not None:
+                    c['_last_box'] = e['_last_box']
+                c['segments'] = c.get('segments', 1) + 1
+                # Remember every original ByteTrack ID that folded into this
+                # canonical — used below to inherit loitering flags after
+                # stitching (a loitering event was recorded against the
+                # original ID, but the summary now shows the canonical).
+                if '_merged_ids' not in c:
+                    c['_merged_ids'] = [c['trackId']]
+                c['_merged_ids'].append(e['trackId'])
+            else:
+                e.setdefault('_merged_ids', [e['trackId']])
+                canonicals.append(e)
+        return {c['trackId']: c for c in canonicals}
+
+    summary['persons']  = stitch_tracks(summary['persons'])
+    summary['vehicles'] = stitch_tracks(summary['vehicles'])
+
+    # Propagate loitering flag onto the canonical person entry. A merged
+    # track loitered if ANY of the original ByteTrack IDs that fold into
+    # it crossed the dwell threshold. Also copy over the peak dwell for
+    # the row subtitle.
+    loit_by_tid = {l['trackId']: l for l in summary['loitering']}
+    for c in summary['persons'].values():
+        ids = c.get('_merged_ids', [c['trackId']])
+        peak = 0.0
+        for tid in ids:
+            l = loit_by_tid.get(tid)
+            if l is not None:
+                c['loitering'] = True
+                if l.get('peak_dwell_s', 0) > peak:
+                    peak = l['peak_dwell_s']
+        if c.get('loitering') and peak > 0:
+            c['peak_dwell_s'] = peak
+
+    def _finalize(entries):
+        out = []
+        for e in sorted(entries.values(), key=lambda x: x['first_s']):
+            e2 = {k: v for k, v in e.items() if not k.startswith('_')}
+            e2['duration_s'] = round(e['last_s'] - e['first_s'], 1)
+            if 'avg_conf' in e2:
+                e2['avg_conf'] = round(e2['avg_conf'], 3)
+            out.append(e2)
+        return out
+    persons_list  = _finalize(summary['persons'])
+    vehicles_list = _finalize(summary['vehicles'])
     if progress_json:
         payload = {
             'type': 'summary',
