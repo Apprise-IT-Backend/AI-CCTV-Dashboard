@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" \"c:\\\\Users\\\\User\\\\Documents\\\\GitHub\\\\AI-face-recognition\\\\face-ai\\\\_paddle_check.py\")",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -m pip uninstall -y paddleocr paddlex paddlepaddle)",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -m pip install \"paddlepaddle==2.6.2\" \"paddleocr==2.7.3\")",
+      "Bash('C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe' -c ' *)"
+    ]
+  }
+}

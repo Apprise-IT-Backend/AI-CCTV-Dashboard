@@ -162,6 +162,39 @@ def get_ocr_reader():
         return ocr_reader
 
 
+# ── PaddleOCR (English) — ensemble partner ──────────────────────
+# PaddleOCR's `en` model is substantially cleaner than EasyOCR on Latin
+# letters and digits, particularly on small / low-contrast / angled
+# plates. Its Bangla model isn't distributed in the 2.7 line, so we run
+# PaddleOCR alongside EasyOCR (not instead of it): PaddleOCR catches the
+# digit-heavy portions of BD plates, EasyOCR handles Bangla script. Then
+# we vote by confidence on each preprocessed variant.
+paddle_reader = None
+paddle_reader_lock = threading.Lock()
+_paddle_import_failed = False
+
+def get_paddle_reader():
+    """Return a cached PaddleOCR-en reader, or None if unavailable."""
+    global paddle_reader, _paddle_import_failed
+    if paddle_reader is not None or _paddle_import_failed:
+        return paddle_reader
+    with paddle_reader_lock:
+        if paddle_reader is not None or _paddle_import_failed:
+            return paddle_reader
+        try:
+            from paddleocr import PaddleOCR
+            log({'type': 'info', 'message': 'Loading PaddleOCR (en) — first run downloads ~20MB'})
+            # use_angle_cls=True enables the direction classifier which flips
+            # 90/180/270-rotated crops right-side up before recognition — a
+            # cheap improvement for CCTV plates seen at random angles.
+            paddle_reader = PaddleOCR(lang='en', use_angle_cls=True, show_log=False)
+            log({'type': 'info', 'message': 'PaddleOCR ready'})
+        except Exception as e:
+            _paddle_import_failed = True
+            log({'type': 'warning', 'message': f'PaddleOCR unavailable ({e}) — falling back to EasyOCR only.'})
+        return paddle_reader
+
+
 def find_plate_rois(vehicle_bgr):
     """Contour-based fallback: return candidate plate crops from a vehicle image.
 
@@ -217,10 +250,10 @@ def enhance_plate_crop(crop_bgr, target_h=128):
 
     EasyOCR on the raw crop frequently fails on plates that are small,
     dim, motion-blurred, or heavily compressed — even ones a human can
-    read at a glance. The three-variant ensemble here catches most of
-    them for one extra OCR call per plate candidate (still cheap given
-    plate OCR is throttled to once every PLATE_OCR_INTERVAL_S per
-    vehicle track).
+    read at a glance. Every variant here catches some subset of failures
+    the others miss, for one extra OCR call each. Plate OCR is throttled
+    to once every PLATE_OCR_INTERVAL_S per vehicle track so 4-5 calls
+    per plate is still fine.
 
     Variants, in the order they help most often:
       1. **Upscaled + CLAHE** — bicubic upsample so the OCR has enough
@@ -231,7 +264,14 @@ def enhance_plate_crop(crop_bgr, target_h=128):
          top of (1). Helps mildly-defocused plates; would hallucinate
          detail on completely-blurred ones, but at that point OCR is
          hopeless anyway.
-      3. **Raw** — baseline. Kept because sometimes the raw crop is
+      3. **Grayscale-normalized** — CLAHE-boosted single-channel version.
+         EasyOCR sometimes reads text on grayscale that it misses on
+         color, particularly on plates where colour bleeds through the
+         glyph edges (JPEG chroma subsampling, low bitrate).
+      4. **Adaptive threshold** — binarizes the plate to pure
+         black/white. Effective on stamped/painted plates when the OCR's
+         built-in binarization struggles with uneven lighting.
+      5. **Raw** — baseline. Kept because sometimes the raw crop is
          already crisp and our preprocessing introduces artifacts that
          hurt more than they help.
     """
@@ -255,8 +295,8 @@ def enhance_plate_crop(crop_bgr, target_h=128):
         lab = cv2.cvtColor(up, cv2.COLOR_BGR2LAB)
         l_ch, a_ch, b_ch = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-        l_ch = clahe.apply(l_ch)
-        contrast = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+        l_ch_boosted = clahe.apply(l_ch)
+        contrast = cv2.cvtColor(cv2.merge([l_ch_boosted, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
         variants.append(contrast)
         # Unsharp mask: subtract a blurred copy from the original weighted
         # 1.5×, back off by 0.5× — a well-behaved deblur that preserves
@@ -264,6 +304,17 @@ def enhance_plate_crop(crop_bgr, target_h=128):
         gauss = cv2.GaussianBlur(contrast, (0, 0), sigmaX=1.5)
         sharpened = cv2.addWeighted(contrast, 1.5, gauss, -0.5, 0)
         variants.append(sharpened)
+        # Grayscale: EasyOCR accepts single-channel input. We convert
+        # back to 3-channel BGR so downstream code doesn't care.
+        gray_boosted = cv2.cvtColor(l_ch_boosted, cv2.COLOR_GRAY2BGR)
+        variants.append(gray_boosted)
+        # Adaptive threshold: binarize per-block so uneven lighting
+        # doesn't wash out one side of the plate. Block size 21 and
+        # constant 8 work well on typical CCTV plate sizes.
+        binarized = cv2.adaptiveThreshold(
+            l_ch_boosted, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 8)
+        variants.append(cv2.cvtColor(binarized, cv2.COLOR_GRAY2BGR))
     except Exception:
         # If colour-space conversion fails on a degenerate crop, we still
         # want to try the raw as a last resort.
@@ -271,6 +322,38 @@ def enhance_plate_crop(crop_bgr, target_h=128):
 
     variants.append(crop_bgr)  # baseline
     return variants
+
+
+def _has_digit(text):
+    """True if `text` contains at least one ASCII or Bengali digit.
+
+    BD plates always contain digits (Bengali ০-৯ = U+09E6..U+09EF or,
+    less commonly, ASCII 0-9). Real text like "ফরচুন" (a company name
+    that appears on truck cabs) has no digit. Using this as a hard
+    reject filter kills most OCR false-positives.
+    """
+    if not text:
+        return False
+    for ch in text:
+        if '0' <= ch <= '9':
+            return True
+        if '\u09E6' <= ch <= '\u09EF':
+            return True
+    return False
+
+
+def _looks_like_plate(text):
+    """Heuristic: reject OCR strings that clearly aren't license plates.
+
+    Rules:
+      - must be at least 4 characters after cleaning (single-digit
+        detections like "4" from a stray sign are almost always noise)
+      - must contain at least one digit (kills company-name false
+        positives like "ফরচুন")
+    """
+    if not text or len(text) < 4:
+        return False
+    return _has_digit(text)
 
 
 def _ocr_plate_variant(reader, variant_bgr):
@@ -298,13 +381,70 @@ def _ocr_plate_variant(reader, variant_bgr):
     return text, conf
 
 
+def _ocr_plate_variant_paddle(reader, variant_bgr):
+    """Run PaddleOCR on one preprocessed variant and return (text, avg_conf).
+
+    PaddleOCR 2.x return shape:
+        [[[bbox, (text, conf)], [bbox, (text, conf)], ...]]
+    where `bbox` is a 4-point polygon. Same top-2 / y-sort join logic as
+    the EasyOCR path so two-line plates aren't scrambled.
+    """
+    try:
+        result = reader.ocr(variant_bgr, cls=True)
+    except Exception as ex:
+        log({'type': 'warning', 'message': f'PaddleOCR failed: {ex}'})
+        return '', 0.0
+    if not result or not result[0]:
+        return '', 0.0
+    # Flatten (bbox, (text, conf)) tuples across the (single) page.
+    lines = []
+    for entry in result[0]:
+        try:
+            bbox, (text, conf) = entry
+            if conf is None: continue
+            lines.append((bbox, text, float(conf)))
+        except Exception:
+            continue
+    if not lines:
+        return '', 0.0
+    lines.sort(key=lambda r: r[2], reverse=True)
+    top = [l for l in lines if l[2] >= PLATE_MIN_CONF][:2]
+    if not top:
+        return '', 0.0
+    top.sort(key=lambda l: min(pt[1] for pt in l[0]))
+    text = clean_plate_text(' '.join(l[1] for l in top))
+    conf = float(sum(l[2] for l in top) / len(top))
+    return text, conf
+
+
+def _iou(a, b):
+    """IoU of two (x, y, w, h) boxes. Used to dedupe overlapping candidates."""
+    ax1, ay1, aw, ah = a; ax2, ay2 = ax1 + aw, ay1 + ah
+    bx1, by1, bw, bh = b; bx2, by2 = bx1 + bw, by1 + bh
+    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1: return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
 def detect_plates_in_vehicle(vehicle_bgr):
     """Return a list of {box:(x,y,w,h), text:str, conf:float} for a vehicle crop.
 
-    Uses `plate_model` when present; otherwise falls back to contour ROIs.
+    Combines the plate YOLO model and the contour fallback (previously
+    only used if the model returned nothing) so an angled or partial
+    plate that scored low in the model can still be caught by contour
+    heuristics, and vice versa. IoU-dedupes overlapping candidates.
+
     Each candidate crop is passed through `enhance_plate_crop` and OCR'd
-    on every variant — the highest-confidence read wins. `text` may be
-    '' if none of the variants cleared PLATE_MIN_CONF.
+    on every variant — the highest-confidence read that passes
+    `_looks_like_plate` wins.
+
+    If NO candidates survive, we run OCR on the entire vehicle crop as a
+    last resort. EasyOCR's built-in text detector (CRAFT) can find plate
+    text even when our plate detector missed the ROI — this is the fix
+    for the "clearly-visible plate but zero detections" case.
     """
     if vehicle_bgr is None or vehicle_bgr.size == 0:
         return []
@@ -330,24 +470,38 @@ def detect_plates_in_vehicle(vehicle_bgr):
         except Exception as ex:
             log({'type': 'warning', 'message': f'Plate model inference failed: {ex}'})
 
-    if not candidates:
-        candidates = find_plate_rois(vehicle_bgr)
+    # Merge in contour candidates whether or not the plate model found
+    # anything. When both fire on the same region the IoU dedup below
+    # keeps just one.
+    for cand in find_plate_rois(vehicle_bgr):
+        if not any(_iou(cand, c) > 0.5 for c in candidates):
+            candidates.append(cand)
 
-    reader = get_ocr_reader()
+    easy = get_ocr_reader()
+    paddle = get_paddle_reader()
     out = []
     for (x, y, w, h) in candidates:
         crop = vehicle_bgr[y:y+h, x:x+w]
         best_text, best_conf = '', 0.0
-        if reader is not None and crop.size > 0:
-            # Ensemble: try each preprocessing variant, keep the highest-
-            # confidence non-empty result. Empirically the CLAHE variant
-            # wins ~60% of the time on the test clips, sharpen ~25%, raw
-            # ~15% — but which one wins for a given plate is unpredictable
-            # so we run them all.
+        if crop.size > 0:
+            # Two-engine ensemble: EasyOCR handles Bangla script (which
+            # PaddleOCR's `en` model lacks), PaddleOCR handles Latin
+            # digits and letters (cleaner recognition than EasyOCR on
+            # small / low-contrast text). Both are run on every
+            # preprocessing variant; the highest-confidence
+            # plate-shaped read wins. The `_looks_like_plate` filter
+            # (≥4 chars AND contains a digit) rejects garbage like a
+            # bare "4" or a Bangla company name with no digits.
             for variant in enhance_plate_crop(crop):
-                text, conf = _ocr_plate_variant(reader, variant)
-                if text and conf > best_conf:
-                    best_text, best_conf = text, conf
+                for reader, runner in (
+                    (easy,   _ocr_plate_variant),
+                    (paddle, _ocr_plate_variant_paddle),
+                ):
+                    if reader is None:
+                        continue
+                    text, conf = runner(reader, variant)
+                    if text and _looks_like_plate(text) and conf > best_conf:
+                        best_text, best_conf = text, conf
         out.append({'box': (x, y, w, h), 'text': best_text, 'conf': best_conf})
     return out
 
