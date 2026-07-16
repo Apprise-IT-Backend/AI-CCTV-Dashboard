@@ -695,6 +695,13 @@ def process_video(input_path, output_path, enrollment_dir=None,
             for tid in list(plate_state.keys()):
                 if now - plate_state[tid].get('last_ocr_at', 0) > 10.0:
                     del plate_state[tid]
+            # Everything above runs on `small` (0.5× downscaled) for speed,
+            # but plates are the smallest thing we care about — running plate
+            # detection at half-resolution means a plate that's 50px at
+            # source is ~25px by the time the detector sees it, which is
+            # below the point where EasyOCR can separate glyphs. Do plate
+            # work on the FULL-RES `frame` so those extra pixels survive.
+            H_frame, W_frame = frame.shape[:2]
             for (tid, x1p, y1p, x2p, y2p, veh_label) in vehicles:
                 if tid is None: continue
                 ps = plate_state.setdefault(tid, {
@@ -710,14 +717,20 @@ def process_video(input_path, output_path, enrollment_dir=None,
                         })
                     continue
                 ps['last_ocr_at'] = now
-                crop = small[y1p:y2p, x1p:x2p]
+                # Full-res vehicle crop: map small-frame pixel coords back
+                # to source-frame pixel coords via the frame-dimension ratio.
+                X1p = int(x1p * W_frame / sw); Y1p = int(y1p * H_frame / sh)
+                X2p = int(x2p * W_frame / sw); Y2p = int(y2p * H_frame / sh)
+                crop = frame[Y1p:Y2p, X1p:X2p]
                 plates = detect.detect_plates_in_vehicle(crop)
                 if not plates: continue
                 plates.sort(key=lambda p: p['conf'], reverse=True)
                 best = plates[0]
                 px, py, pw, ph = best['box']
-                axn = (x1p + px) / sw; ayn = (y1p + py) / sh
-                awn = pw / sw; ahn = ph / sh
+                # `best['box']` is in the full-res crop's coord space; map
+                # back to normalized frame coords using full-res dims.
+                axn = (X1p + px) / W_frame; ayn = (Y1p + py) / H_frame
+                awn = pw / W_frame; ahn = ph / H_frame
                 text = best['text']
                 if text:
                     ps['votes'][text] = ps['votes'].get(text, 0) + 1
