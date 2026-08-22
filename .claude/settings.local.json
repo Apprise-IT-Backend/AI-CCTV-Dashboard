@@ -4,7 +4,28 @@
       "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" \"c:\\\\Users\\\\User\\\\Documents\\\\GitHub\\\\AI-face-recognition\\\\face-ai\\\\_paddle_check.py\")",
       "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -m pip uninstall -y paddleocr paddlex paddlepaddle)",
       "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -m pip install \"paddlepaddle==2.6.2\" \"paddleocr==2.7.3\")",
-      "Bash('C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe' -c ' *)"
+      "Bash('C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe' -c ' *)",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" _probe_plate.py test_plate.jpg)",
+      "Bash(grep -vE \"^\\\\s*$|Load|Loading|WARNING|InitGoogle|paddle\\\\.\")",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" _dump_plate_crop.py)",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" _sr_test.py)",
+      "Bash(grep -vE \"^\\\\s*$|WARNING|Load|Loading|InitGoogle|paddle\\\\.|debug|\\\\[|paddleocr\\\\.| I[0-9]\")",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -u _sr_test.py)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(./ffmpeg.exe -rtsp_transport tcp -timeout 8000000 -i \"rtsp://192.168.1.10:8080/h264_aac.sdp\" -t 1 -f null -)",
+      "Bash(tasklist)",
+      "Bash(netstat -ano)",
+      "Bash(curl -s -m 5 http://127.0.0.1:9997/v3/paths/list)",
+      "Bash(python -m json.tool)",
+      "Bash(mysql -u root ai_cctv -e \"SELECT camera_name, path_name, rtsp_url FROM cameras;\")",
+      "Bash(timeout 35 \"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -u agent/agent.py http://127.0.0.1:3000 camera_e834621f_0805_48b1_b944_f4f9c44d9b64 \"rtsp://192.168.1.10:8080/h264_aac.sdp\")",
+      "Bash(rm -f ffmpeg.zip)",
+      "Bash(curl -L -s -o ffmpeg_new.zip \"https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip\")",
+      "Bash(\"C:\\\\Users\\\\User\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import zipfile;print\\('valid zip:',zipfile.is_zipfile\\('ffmpeg_new.zip'\\)\\)\")",
+      "Bash(rm -f ffmpeg_new.zip)",
+      "Bash(./ffmpeg.exe -rtsp_transport tcp -timeout 15000000 -i \"rtsp://192.168.1.10:8080/h264_aac.sdp\" -t 1 -f null -)",
+      "Bash(./ffprobe.exe -v error -rtsp_transport tcp -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 \"rtsp://192.168.1.10:8080/h264_aac.sdp\")",
+      "WebSearch"
     ]
   }
 }

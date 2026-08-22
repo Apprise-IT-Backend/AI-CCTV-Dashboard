@@ -76,6 +76,9 @@ const DETECTION_COLORS = {
   loitering:  '#fb923c',   // orange — attention but softer than fire red
   vehicle:    '#94a3b8',
   plate:      '#22d3ee',   // cyan — reads well over both dark and light plates
+  bag:        '#a78bfa',   // violet — no other detection type uses it
+  bagCounted: '#34d399',   // green once the bag has been tallied
+  bagLine:    '#f472b6',   // pink counting line, distinct from every box color
 };
 
 // Box color when a recognized face has an enrollment category. Falls back to
@@ -90,6 +93,9 @@ const PERSON_TYPE_COLORS = {
 
 function colorForDetection(d) {
   if (d.loitering) return DETECTION_COLORS.loitering;
+  if (d.label === 'bag') {
+    return d.counted ? DETECTION_COLORS.bagCounted : DETECTION_COLORS.bag;
+  }
   if (d.label === 'plate')   return DETECTION_COLORS.plate;
   if (d.label === 'vehicle') return DETECTION_COLORS.vehicle;
   if (d.name && d.label === 'face') {
@@ -182,6 +188,13 @@ function connectSocket() {
     }
   });
 
+  // Conveyor throughput. The backend owns the running total (MySQL), so this
+  // is authoritative — the frontend never accumulates counts itself.
+  socket.on('bag_count', ({ streamId, total, delta }) => {
+    const cam = cameras.get(streamId);
+    if (cam) setBagCount(cam, total, delta > 0);
+  });
+
   socket.on('agent_status', ({ message }) => {
     const modal = document.getElementById('agent-modal');
     if (modal && modal.style.display === 'flex') {
@@ -221,6 +234,7 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
       <video autoplay muted playsinline crossorigin="anonymous"></video>
       <canvas></canvas>
       <div class="tile-timestamp">—</div>
+      <div class="tile-bagcount"><svg><use href="#i-box"/></svg><span class="bag-total">0</span></div>
       <div class="tile-rec-badge"><span class="rec-dot"></span>REC <span class="rec-elapsed">0:00</span></div>
       <div class="tile-controls">
         <button class="rec" title="Start recording"><svg><use href="#i-record"/></svg></button>
@@ -241,14 +255,17 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
   const recButton = tile.querySelector('.rec');
   const recBadge = tile.querySelector('.tile-rec-badge');
   const recElapsed = tile.querySelector('.rec-elapsed');
+  const bagCountEl = tile.querySelector('.tile-bagcount');
 
   const cam = {
     streamId, cameraName, tile, video, canvas, statusPill, statusLabel, latencyEl, tsEl,
-    recButton, recBadge, recElapsed,
+    recButton, recBadge, recElapsed, bagCountEl,
     hlsUrl, transport: null,
     state: 'connecting',
     lastDetections: [], lastUpdate: 0,
     lastIncidents: [], lastIncidentUpdate: 0,
+    // Conveyor counting: null line = feature off for this camera.
+    bagLine: null, bagTotal: null, bagLinePreview: null,
   };
   cameras.set(streamId, cam);
 
@@ -569,6 +586,8 @@ function drawDetections(cam) {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+  drawBagLine(cam, ctx);
+
   for (const d of lastDetections) {
     const x = d.x * canvas.width, y = d.y * canvas.height;
     const w = d.w * canvas.width, h = d.h * canvas.height;
@@ -580,6 +599,8 @@ function drawDetections(cam) {
     let tag;
     if (d.loitering) {
       tag = `LOITERING ${d.dwellSeconds != null ? d.dwellSeconds + 's' : ''}`.trim();
+    } else if (d.label === 'bag') {
+      tag = d.trackId != null ? `BAG #${d.trackId}` : 'BAG';
     } else if (d.label === 'plate') {
       tag = d.name ? `PLATE ${d.name}` : 'PLATE';
     } else if (d.label === 'vehicle') {
@@ -604,11 +625,273 @@ function drawDetections(cam) {
   tile.classList.toggle('incident-alert', lastIncidents.length > 0);
 }
 
+// ── Conveyor bag counting ────────────────────────────────
+// Draws the counting line and its direction arrow. Coordinates use the exact
+// same normalized-to-canvas convention as detection boxes, so a line the user
+// drags on the tile lands where the AI worker thinks it is.
+function drawBagLine(cam, ctx) {
+  const line = cam.bagLinePreview || cam.bagLine;
+  if (!line) return;
+  const { canvas } = cam;
+  const x1 = line.x1 * canvas.width, y1 = line.y1 * canvas.height;
+  const x2 = line.x2 * canvas.width, y2 = line.y2 * canvas.height;
+
+  ctx.save();
+  ctx.strokeStyle = DETECTION_COLORS.bagLine;
+  ctx.lineWidth = 2;
+  if (cam.bagLinePreview) ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Endpoint handles make it obvious the line is draggable/re-settable.
+  ctx.fillStyle = DETECTION_COLORS.bagLine;
+  for (const [hx, hy] of [[x1, y1], [x2, y2]]) {
+    ctx.beginPath();
+    ctx.arc(hx, hy, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Direction arrow at the midpoint, normal to the line, showing which way a
+  // crossing must travel to be counted ('both' gets no arrow).
+  if (line.direction && line.direction !== 'both') {
+    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    const len = Math.hypot(x2 - x1, y2 - y1) || 1;
+    // Normal of the segment; sign flips for the 'negative' sense.
+    const sign = line.direction === 'positive' ? 1 : -1;
+    const nx = (-(y2 - y1) / len) * sign, ny = ((x2 - x1) / len) * sign;
+    const tipX = mx + nx * 18, tipY = my + ny * 18;
+    ctx.beginPath();
+    ctx.moveTo(mx, my);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(tipX, tipY);
+    ctx.lineTo(tipX - ny * 4 - nx * 5, tipY + nx * 4 - ny * 5);
+    ctx.lineTo(tipX + ny * 4 - nx * 5, tipY - nx * 4 - ny * 5);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// Show/refresh the per-tile running total. `flash` pulses the chip so an
+// operator watching the grid sees the count tick without reading the number.
+function setBagCount(cam, total, flash = false) {
+  cam.bagTotal = total;
+  if (!cam.bagCountEl) return;
+  const show = total != null;
+  cam.bagCountEl.classList.toggle('show', show);
+  if (!show) return;
+  cam.bagCountEl.querySelector('.bag-total').textContent = total.toLocaleString();
+  if (flash) {
+    cam.bagCountEl.classList.remove('bump');
+    // Force a reflow so the animation restarts on consecutive crossings.
+    void cam.bagCountEl.offsetWidth;
+    cam.bagCountEl.classList.add('bump');
+  }
+}
+
+function applyBagLine(cam, bagLine, bagTotal) {
+  cam.bagLine = bagLine || null;
+  setBagCount(cam, bagLine ? (bagTotal ?? cam.bagTotal ?? 0) : null);
+  drawDetections(cam);
+}
+
+// Why a line can be geometrically valid yet count nothing: bags are tracked by
+// their centroid, which is always strictly inside the frame, so it can never
+// reach the far side of a line lying on a frame edge. Clicking just outside the
+// video clamps both endpoints onto that edge. Mirrors parseBagLine (backend) and
+// normalize_line (bag_counter.py) — keep all three in step.
+const BAG_LINE_EDGE_EPS = 0.01;
+
+function bagLineProblem(line) {
+  if (!line) return 'no line set';
+  if (Math.hypot(line.x2 - line.x1, line.y2 - line.y1) < 0.02) {
+    return 'the two points are too close together';
+  }
+  const e = BAG_LINE_EDGE_EPS;
+  const onEdge =
+    Math.max(line.y1, line.y2) <= e || Math.min(line.y1, line.y2) >= 1 - e ||
+    Math.max(line.x1, line.x2) <= e || Math.min(line.x1, line.x2) >= 1 - e;
+  if (onEdge) {
+    return 'the line sits on the frame edge — bags can never cross it. Draw it across the belt, inside the picture.';
+  }
+  return null;
+}
+
+// Two-click line placement directly on the live tile. Clicking the same point
+// twice (or pressing Escape) cancels, so a stray click can't wipe a good line.
+function startBagLineSetup(streamId) {
+  const cam = cameras.get(streamId);
+  if (!cam || cam.bagLineSetup) return;
+  const wrap = cam.video.parentElement;
+  const hint = document.createElement('div');
+  hint.className = 'bagline-hint';
+  hint.textContent = 'Click the two ends of the counting line — Esc to cancel';
+  wrap.appendChild(hint);
+  wrap.classList.add('bagline-editing');
+
+  let first = null;
+  const toNorm = (ev) => {
+    const r = cam.canvas.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
+    };
+  };
+
+  const finish = (line) => {
+    wrap.classList.remove('bagline-editing');
+    hint.remove();
+    cam.canvas.removeEventListener('click', onClick);
+    cam.canvas.removeEventListener('mousemove', onMove);
+    document.removeEventListener('keydown', onKey);
+    cam.bagLinePreview = null;
+    cam.bagLineSetup = false;
+    if (line) saveBagLine(streamId, line);
+    else drawDetections(cam);
+  };
+
+  const onClick = (ev) => {
+    ev.stopPropagation();
+    const p = toNorm(ev);
+    if (!first) {
+      first = p;
+      hint.textContent = 'Now click the other end';
+      return;
+    }
+    const candidate = {
+      x1: first.x, y1: first.y, x2: p.x, y2: p.y,
+      direction: cam.bagLine?.direction || 'both',
+      roi: cam.bagLine?.roi || null,
+      // Preserve the mode — moving the line must not silently reset it.
+      mode: cam.bagLine?.mode || 'gate',
+    };
+    const problem = bagLineProblem(candidate);
+    if (problem) {
+      // Restart the placement rather than storing a line that can't count.
+      first = null;
+      cam.bagLinePreview = null;
+      hint.textContent = `Can't use that line — ${problem}`;
+      drawDetections(cam);
+      return;
+    }
+    finish(candidate);
+  };
+  const onMove = (ev) => {
+    if (!first) return;
+    const p = toNorm(ev);
+    cam.bagLinePreview = { x1: first.x, y1: first.y, x2: p.x, y2: p.y, direction: 'both' };
+    drawDetections(cam);
+  };
+  const onKey = (ev) => { if (ev.key === 'Escape') finish(null); };
+
+  cam.bagLineSetup = true;
+  cam.canvas.addEventListener('click', onClick);
+  cam.canvas.addEventListener('mousemove', onMove);
+  document.addEventListener('keydown', onKey);
+}
+
+async function saveBagLine(streamId, line) {
+  const cam = cameras.get(streamId);
+  try {
+    const r = await authedFetch(`${API}/camera/${streamId}/bag-line`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: true, ...line }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'save failed');
+    if (cam) applyBagLine(cam, data.bagLine, data.bagTotal);
+  } catch (err) {
+    alert(`Could not save counting line: ${err.message}`);
+    if (cam) drawDetections(cam);
+  }
+}
+
+async function disableBagCounting(streamId) {
+  const cam = cameras.get(streamId);
+  try {
+    const r = await authedFetch(`${API}/camera/${streamId}/bag-line`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error || 'update failed');
+    if (cam) applyBagLine(cam, null, null);
+  } catch (err) {
+    alert(`Could not disable bag counting: ${err.message}`);
+  }
+}
+
+// Toggle gate <-> track. Gate is the accurate default on a loaded belt; track
+// exists for when you want per-bag boxes and IDs on a sparse one.
+async function toggleBagMode(streamId) {
+  const cam = cameras.get(streamId);
+  if (!cam?.bagLine) return;
+  const next = (cam.bagLine.mode || 'gate') === 'gate' ? 'track' : 'gate';
+  await saveBagLine(streamId, { ...cam.bagLine, mode: next });
+}
+
+// Cycles both-ways -> one-way -> the other way. One-way counting is what you
+// want when the belt can run in reverse and you only care about output.
+async function cycleBagDirection(streamId) {
+  const cam = cameras.get(streamId);
+  if (!cam?.bagLine) return;
+  const order = ['both', 'positive', 'negative'];
+  const next = order[(order.indexOf(cam.bagLine.direction) + 1) % order.length];
+  await saveBagLine(streamId, { ...cam.bagLine, direction: next });
+}
+
+async function resetBagCount(streamId) {
+  if (!confirm('Reset this camera\'s bag counter to zero?\n\nThroughput history is kept — only the running total restarts.')) return;
+  try {
+    const r = await authedFetch(`${API}/camera/${streamId}/bag-count/reset`, { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).error || 'reset failed');
+    const cam = cameras.get(streamId);
+    if (cam) setBagCount(cam, 0);
+  } catch (err) {
+    alert(`Could not reset counter: ${err.message}`);
+  }
+}
+
 // ── Tile context menu ────────────────────────────────────
 const tileMenu = document.getElementById('tile-menu');
 let menuStreamId = null;
 function openTileMenu(streamId, anchor) {
   menuStreamId = streamId;
+  // Bag-counting items only make sense once a line exists; the first item
+  // doubles as "set" and "move" so the label has to track state too.
+  const cam = cameras.get(streamId);
+  const hasLine = !!cam?.bagLine;
+  tileMenu.querySelectorAll('.bag-only').forEach((el) => {
+    el.style.display = hasLine ? 'flex' : 'none';
+  });
+  const setLabel = tileMenu.querySelector('.bagline-label');
+  if (setLabel) setLabel.textContent = hasLine ? 'Move bag counting line' : 'Set bag counting line';
+
+  const mode = cam?.bagLine?.mode || 'gate';
+  const modeLabel = tileMenu.querySelector('.bagmode-label');
+  if (modeLabel) {
+    modeLabel.textContent = mode === 'gate'
+      ? 'Mode: gate (accurate count)'
+      : 'Mode: track (per-bag boxes)';
+  }
+  // Direction is meaningless for a gate — a single tripwire can't tell which way
+  // traffic moved — so don't offer a control that would silently do nothing.
+  tileMenu.querySelectorAll('.bag-track-only').forEach((el) => {
+    el.style.display = (hasLine && mode === 'track') ? 'flex' : 'none';
+  });
+  const dirLabel = tileMenu.querySelector('.bagdir-label');
+  if (dirLabel) {
+    const dir = cam?.bagLine?.direction || 'both';
+    const human = dir === 'both' ? 'both ways' : dir === 'positive' ? 'one way' : 'one way (reversed)';
+    dirLabel.textContent = `Counting direction: ${human}`;
+  }
+
   const r = anchor.getBoundingClientRect();
   tileMenu.style.display = 'flex';
   tileMenu.style.top = `${r.bottom + 4}px`;
@@ -627,6 +910,11 @@ tileMenu.addEventListener('click', async (e) => {
   if (action === 'remove') await removeCamera(sid);
   else if (action === 'screenshot') screenshotTile(sid);
   else if (action === 'fullscreen') fullscreenTile(sid);
+  else if (action === 'bagline') startBagLineSetup(sid);
+  else if (action === 'bagmode') await toggleBagMode(sid);
+  else if (action === 'bagdirection') await cycleBagDirection(sid);
+  else if (action === 'bagreset') await resetBagCount(sid);
+  else if (action === 'bagoff') await disableBagCounting(sid);
 });
 
 function fullscreenTile(streamId) {
@@ -2418,12 +2706,148 @@ window.analyzeModule = (() => {
     sel.style.display = 'flex';
     sel.innerHTML = `<span><b>${f.name}</b></span><span>${fmtBytes(f.size)}</span>`;
     $submit().disabled = false;
+    // A new clip invalidates any line drawn on the previous one.
+    state.bagLine = null;
+    state.bagFrame = null;
+    refreshBagPicker();
+  }
+
+  // ── Conveyor bag counting: line picker ──────────────────
+  // The line has to be drawn on a real frame of the user's own clip — guessing
+  // coordinates for an unseen camera angle is hopeless. We grab one frame
+  // client-side (no upload needed) and let them click the two ends.
+  const $bagChk    = () => document.getElementById('analyze-bags');
+  const $bagWrap   = () => document.getElementById('analyze-bagline');
+  const $bagCanvas = () => document.getElementById('analyze-bagline-canvas');
+  const $bagHint   = () => document.getElementById('analyze-bagline-hint');
+  const $bagStatus = () => document.getElementById('analyze-bagline-status');
+  const $bagDir    = () => document.getElementById('analyze-bag-direction');
+
+  function refreshBagPicker() {
+    const wrap = $bagWrap();
+    if (!wrap) return;
+    const on = !!$bagChk()?.checked && !!state.file;
+    wrap.style.display = on ? '' : 'none';
+    if (!on) return;
+    if (state.bagFrame) { drawBagPreview(); return; }
+    grabPreviewFrame().then(() => drawBagPreview()).catch((err) => {
+      $bagStatus().textContent = `Could not read a frame from this file (${err.message})`;
+    });
+  }
+
+  // Decode a single frame into an offscreen canvas we can redraw the line over
+  // without re-seeking the video each time.
+  function grabPreviewFrame() {
+    return new Promise((resolve, reject) => {
+      const f = state.file;
+      if (!f) return reject(new Error('no file'));
+      const url = URL.createObjectURL(f);
+      const v = document.createElement('video');
+      v.muted = true;
+      v.preload = 'auto';
+      const cleanup = () => { URL.revokeObjectURL(url); };
+      const fail = (msg) => { cleanup(); reject(new Error(msg)); };
+      v.addEventListener('error', () => fail('decode failed'));
+      v.addEventListener('loadeddata', () => {
+        // A second in is usually past any fade-in or camera OSD flash.
+        v.currentTime = Math.min(1.0, (v.duration || 2) / 2);
+      });
+      v.addEventListener('seeked', () => {
+        const c = document.createElement('canvas');
+        c.width = v.videoWidth;
+        c.height = v.videoHeight;
+        c.getContext('2d').drawImage(v, 0, 0);
+        state.bagFrame = c;
+        cleanup();
+        resolve();
+      }, { once: true });
+      setTimeout(() => { if (!state.bagFrame) fail('timed out reading the video'); }, 15000);
+      v.src = url;
+    });
+  }
+
+  function drawBagPreview() {
+    const src = state.bagFrame;
+    const canvas = $bagCanvas();
+    if (!src || !canvas) return;
+    // Fit the stage width, keep the clip's aspect ratio.
+    const boxW = canvas.parentElement.clientWidth || 480;
+    canvas.width = boxW;
+    canvas.height = Math.round(boxW * src.height / src.width);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+
+    const line = state.bagLinePreview || state.bagLine;
+    if (!line) {
+      $bagStatus().textContent = 'No line set';
+      return;
+    }
+    ctx.strokeStyle = DETECTION_COLORS.bagLine;
+    ctx.fillStyle = DETECTION_COLORS.bagLine;
+    ctx.lineWidth = 2;
+    if (state.bagLinePreview) ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(line.x1 * canvas.width, line.y1 * canvas.height);
+    ctx.lineTo(line.x2 * canvas.width, line.y2 * canvas.height);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    for (const [hx, hy] of [[line.x1, line.y1], [line.x2, line.y2]]) {
+      ctx.beginPath();
+      ctx.arc(hx * canvas.width, hy * canvas.height, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (state.bagLine) {
+      $bagStatus().textContent =
+        `Line set: (${line.x1.toFixed(2)}, ${line.y1.toFixed(2)}) → (${line.x2.toFixed(2)}, ${line.y2.toFixed(2)})`;
+    }
+  }
+
+  function onBagCanvasClick(ev) {
+    if (!state.bagFrame) return;
+    const canvas = $bagCanvas();
+    const r = canvas.getBoundingClientRect();
+    const p = {
+      x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
+    };
+    if (!state.bagFirstPoint) {
+      state.bagFirstPoint = p;
+      state.bagLine = null;
+      $bagHint().textContent = 'Now click the other end';
+      $bagHint().style.display = '';
+      return;
+    }
+    const a = state.bagFirstPoint;
+    state.bagFirstPoint = null;
+    state.bagLinePreview = null;
+    const candidate = {
+      x1: a.x, y1: a.y, x2: p.x, y2: p.y,
+      direction: $bagDir()?.value || 'both',
+    };
+    const problem = bagLineProblem(candidate);
+    if (problem) {
+      // Say why, and make them redraw — silently keeping an uncountable line is
+      // how you end up with a finished analysis reporting zero bags.
+      $bagHint().textContent = `Can't use that line — ${problem}`;
+      $bagHint().style.display = '';
+      $bagStatus().textContent = 'No line set';
+      drawBagPreview();
+      return;
+    }
+    state.bagLine = candidate;
+    $bagHint().style.display = 'none';
+    drawBagPreview();
   }
 
   function reset() {
     state.jobId = null;
     state.file = null;
     state.summary = null;
+    state.bagLine = null;
+    state.bagFrame = null;
+    state.bagFirstPoint = null;
+    state.bagLinePreview = null;
+    if ($bagWrap()) $bagWrap().style.display = 'none';
     $file().value = '';
     $selected().style.display = 'none';
     $selected().innerHTML = '';
@@ -2467,6 +2891,21 @@ window.analyzeModule = (() => {
     fd.append('detectFire',    document.getElementById('analyze-fire').checked ? 'true' : 'false');
     fd.append('personSensitivity', document.getElementById('analyze-person-sensitivity').value || 'balanced');
     fd.append('detectionQuality',  document.getElementById('analyze-detection-quality').value || 'fast');
+    if ($bagChk()?.checked) {
+      if (!state.bagLine) {
+        // Better to stop than to run a 20-minute analysis that silently
+        // counts nothing.
+        showError('Draw the counting line on the preview frame first (click its two ends), or uncheck bag counting.');
+        btn.textContent = 'Analyze';
+        btn.disabled = false;
+        $progress().style.display = 'none';
+        return;
+      }
+      fd.append('bagLine', JSON.stringify({
+        ...state.bagLine,
+        direction: $bagDir()?.value || 'both',
+      }));
+    }
 
     try {
       const resp = await fetch(`${API}/analyze-video`, {
@@ -2709,6 +3148,11 @@ window.analyzeModule = (() => {
       { label: 'Loitering events', value: counts.loitering_events },
       { label: 'Fire / smoke',     value: counts.fire_events },
     ];
+    // Only show the bag tile when counting actually ran — a "0" on a clip with
+    // no counting line configured would read as "the counter found nothing".
+    if (counts.bags_counted != null) {
+      tiles.push({ label: 'Bags counted', value: counts.bags_counted });
+    }
     const countsEl = document.getElementById('analyze-summary-counts');
     for (const t of countTiles) {
       const el = document.createElement('div');
@@ -2994,6 +3438,7 @@ window.analyzeModule = (() => {
       sSum.addRow(['Plates read',      counts.plates_read      ?? 0]);
       sSum.addRow(['Loitering events', counts.loitering_events ?? 0]);
       sSum.addRow(['Fire / smoke',     counts.fire_events      ?? 0]);
+      if (counts.bags_counted != null) sSum.addRow(['Bags counted', counts.bags_counted]);
 
       // ── Per-category sheets ────────────────────────
       // Images in Excel float above cells rather than sitting inside them.
@@ -3130,6 +3575,30 @@ window.analyzeModule = (() => {
     $submit().addEventListener('click', submit);
     document.getElementById('analyze-new').addEventListener('click', reset);
     $report().addEventListener('click', downloadReport);
+
+    $bagChk()?.addEventListener('change', refreshBagPicker);
+    $bagCanvas()?.addEventListener('click', onBagCanvasClick);
+    $bagCanvas()?.addEventListener('mousemove', (ev) => {
+      if (!state.bagFirstPoint) return;
+      const r = $bagCanvas().getBoundingClientRect();
+      state.bagLinePreview = {
+        x1: state.bagFirstPoint.x, y1: state.bagFirstPoint.y,
+        x2: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+        y2: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
+      };
+      drawBagPreview();
+    });
+    $bagDir()?.addEventListener('change', () => {
+      if (state.bagLine) state.bagLine.direction = $bagDir().value;
+    });
+    document.getElementById('analyze-bagline-clear')?.addEventListener('click', () => {
+      state.bagLine = null;
+      state.bagFirstPoint = null;
+      state.bagLinePreview = null;
+      $bagHint().textContent = 'Click the two ends of the counting line';
+      $bagHint().style.display = '';
+      drawBagPreview();
+    });
   }
 
   return { wire, reset, onProgress };
@@ -3226,8 +3695,10 @@ async function bootAuthedUI() {
 
   // Load existing cameras
   const list = await (await authedFetch(`${API}/cameras`)).json();
-  for (const { streamId, cameraName, hlsUrl } of list) {
-    if (!cameras.has(streamId)) makeTile(streamId, cameraName, hlsUrl);
+  for (const { streamId, cameraName, hlsUrl, bagLine, bagTotal } of list) {
+    const cam = cameras.get(streamId) || makeTile(streamId, cameraName, hlsUrl);
+    // Restore each camera's counting line + running total after a page reload.
+    if (bagLine) applyBagLine(cam, bagLine, bagTotal);
   }
 
   // Periodic refreshers

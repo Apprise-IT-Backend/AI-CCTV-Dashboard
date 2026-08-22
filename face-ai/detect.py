@@ -15,6 +15,7 @@ from mediapipe.tasks.python import vision as mp_vision
 from ultralytics import YOLO
 import torch
 from facenet_pytorch import InceptionResnetV1
+from bag_counter import make_counter as make_bag_counter, normalize_line as normalize_bag_line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENROLLMENT_DIR = os.path.join(HERE, 'enrollments')
@@ -25,6 +26,10 @@ FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
 # Optional Bangla license-plate detector — YOLO weights fine-tuned on BD plates.
 # When missing we fall back to contour-based ROI extraction on vehicle crops.
 PLATE_MODEL_PATH = os.path.join(HERE, 'plate_model.pt')
+# Optional single-class ("bag") YOLO checkpoint for conveyor counting. Absent by
+# default — the counter falls back to ROI background subtraction, which is
+# usually enough on a fixed camera. See bag_counter.py.
+BAG_MODEL_PATH = os.path.join(HERE, 'bag_model.pt')
 
 # ── Loitering ──────────────────────────────────────────────────
 # A tracked person that stays in-frame longer than this is flagged as loitering.
@@ -136,6 +141,20 @@ else:
     log({'type': 'info', 'message': 'No plate_model.pt found — using contour-based plate ROI extraction.'})
 plate_model_lock = threading.Lock()
 
+# ── Conveyor bag counter ──────────────────────────────────────
+# Optional trained detector. When missing, BagCounter uses motion segmentation
+# instead — no weights, no training data, works on a fixed camera.
+bag_model = None
+if os.path.exists(BAG_MODEL_PATH) and os.path.getsize(BAG_MODEL_PATH) > 1000000:
+    try:
+        bag_model = YOLO(BAG_MODEL_PATH)
+        log({'type': 'info', 'message': 'Custom Bag Model loaded'})
+    except Exception as e:
+        log({'type': 'warning', 'message': f'Failed to load bag model: {e}'})
+# Its own lock — never share with yolo_lock, or bag inference on one stream
+# would serialize against person detection on every other stream.
+bag_model_lock = threading.Lock()
+
 # EasyOCR is loaded lazily on first plate detection to keep startup fast and
 # to make the whole plate feature optional. If the module isn't installed we
 # still detect plate regions but leave `name` null.
@@ -193,6 +212,95 @@ def get_paddle_reader():
             _paddle_import_failed = True
             log({'type': 'warning', 'message': f'PaddleOCR unavailable ({e}) — falling back to EasyOCR only.'})
         return paddle_reader
+
+
+# ── Real-ESRGAN super-resolution ────────────────────────────────
+# At the top of the plate pipeline, the YOLO detector often finds plates
+# that are 30-80 px tall — below the point where either OCR engine can
+# separate glyphs, even with our upscale + CLAHE ensemble. Real-ESRGAN
+# 4× brings a 42×36 plate to 168×144 with real learned detail
+# (hallucinated but plausible), not just interpolated pixels. That's the
+# difference between "you can almost read it" and "PaddleOCR reads it".
+#
+# We only run SR when the plate crop is small — bigger crops are fast
+# enough for OCR without SR's ~2-8s CPU cost. `SR_MAX_HEIGHT_PX` sets
+# the threshold. Loaded lazily on first small-plate hit.
+SR_MAX_HEIGHT_PX = 80
+sr_upscaler = None
+sr_upscaler_lock = threading.Lock()
+_sr_import_failed = False
+
+def get_sr_upscaler():
+    """Return a cached Real-ESRGAN 4× upscaler, or None if unavailable."""
+    global sr_upscaler, _sr_import_failed
+    if sr_upscaler is not None or _sr_import_failed:
+        return sr_upscaler
+    with sr_upscaler_lock:
+        if sr_upscaler is not None or _sr_import_failed:
+            return sr_upscaler
+        try:
+            # basicsr (a Real-ESRGAN dep) references torchvision's private
+            # `functional_tensor` module which was removed in newer
+            # torchvision. Shim it before basicsr imports so we don't crash.
+            import sys as _sys
+            try:
+                import torchvision.transforms.functional_tensor  # noqa: F401
+            except ImportError:
+                import torchvision.transforms.functional as _tf
+                _sys.modules['torchvision.transforms.functional_tensor'] = _tf
+            from basicsr.archs.rrdbnet_arch import RRDBNet
+            from realesrgan import RealESRGANer
+            import urllib.request
+            weights_path = os.path.join(
+                os.path.expanduser('~'), '.cache', 'realesrgan',
+                'RealESRGAN_x4plus.pth')
+            if not os.path.isfile(weights_path):
+                os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+                log({'type': 'info', 'message':
+                     'Downloading RealESRGAN_x4plus weights (~64MB)...'})
+                url = ('https://github.com/xinntao/Real-ESRGAN/releases/'
+                       'download/v0.1.0/RealESRGAN_x4plus.pth')
+                urllib.request.urlretrieve(url, weights_path)
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                            num_block=23, num_grow_ch=32, scale=4)
+            log({'type': 'info', 'message':
+                 f'Loading Real-ESRGAN 4× on {_torch_device}'})
+            sr_upscaler = RealESRGANer(
+                scale=4, model_path=weights_path, model=model,
+                tile=0, tile_pad=10, pre_pad=0,
+                half=torch.cuda.is_available(),
+                device=_torch_device,
+            )
+            log({'type': 'info', 'message': 'Real-ESRGAN ready'})
+        except Exception as e:
+            _sr_import_failed = True
+            log({'type': 'warning', 'message':
+                 f'Real-ESRGAN unavailable ({e}) — small plates will not '
+                 f'be super-resolved. `pip install realesrgan` to enable.'})
+        return sr_upscaler
+
+
+def maybe_super_resolve(crop_bgr):
+    """Run 4× super-resolution on `crop_bgr` if it's small; else return as-is.
+
+    "Small" is defined by height (SR_MAX_HEIGHT_PX). Plates larger than
+    that don't need SR — the extra 2-8s CPU cost isn't worth it. Silently
+    returns the input unchanged if SR is unavailable, so callers don't
+    need special-case fallback code.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return crop_bgr
+    if crop_bgr.shape[0] >= SR_MAX_HEIGHT_PX:
+        return crop_bgr
+    up = get_sr_upscaler()
+    if up is None:
+        return crop_bgr
+    try:
+        out, _ = up.enhance(crop_bgr, outscale=4)
+        return out
+    except Exception as ex:
+        log({'type': 'warning', 'message': f'SR failed: {ex}'})
+        return crop_bgr
 
 
 def find_plate_rois(vehicle_bgr):
@@ -482,8 +590,15 @@ def detect_plates_in_vehicle(vehicle_bgr):
     out = []
     for (x, y, w, h) in candidates:
         crop = vehicle_bgr[y:y+h, x:x+w]
+        # Super-resolve small crops before OCR. Below ~80 px tall, bicubic
+        # interpolation in enhance_plate_crop just smooths the same
+        # pixel-perfect blur — SR hallucinates plausible detail from a
+        # learned prior. Empirical measurement on test_plate.jpg: a
+        # 42×36 plate that returned empty on all 10 OCR attempts starts
+        # reading '13000' at 0.75 conf after SR + PaddleOCR.
+        crop_for_ocr = maybe_super_resolve(crop)
         best_text, best_conf = '', 0.0
-        if crop.size > 0:
+        if crop_for_ocr.size > 0:
             # Two-engine ensemble: EasyOCR handles Bangla script (which
             # PaddleOCR's `en` model lacks), PaddleOCR handles Latin
             # digits and letters (cleaner recognition than EasyOCR on
@@ -492,7 +607,7 @@ def detect_plates_in_vehicle(vehicle_bgr):
             # plate-shaped read wins. The `_looks_like_plate` filter
             # (≥4 chars AND contains a digit) rejects garbage like a
             # bare "4" or a Bangla company name with no digits.
-            for variant in enhance_plate_crop(crop):
+            for variant in enhance_plate_crop(crop_for_ocr):
                 for reader, runner in (
                     (easy,   _ocr_plate_variant),
                     (paddle, _ocr_plate_variant_paddle),
@@ -736,7 +851,7 @@ class LatestFrameReader:
         self.stop_event.set()
 
 
-def stream_worker(stream_id, rtsp_url, enrollment_dir):
+def stream_worker(stream_id, rtsp_url, enrollment_dir, bag_line=None):
     stop_event = active_streams[stream_id]['stop']
     log({'type': 'info', 'message': f'Stream worker started: {stream_id} (enroll dir: {enrollment_dir})'})
     enrolled_mtime = 0
@@ -769,6 +884,20 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     # publishing it. Same TTL-cleanup pattern as loitering.
     plate_state = {}
     plate_reported_at = {}  # cleaned_plate_string -> last-emitted timestamp (throttling)
+
+    # ── Bag counting: only runs when this camera has a counting line ──
+    # No line configured => the whole pipeline is skipped, so enabling the
+    # feature is per-camera and a normal (non-conveyor) camera pays nothing.
+    # The counter is published on active_streams so a live line edit from the
+    # dashboard can reach it without restarting the stream.
+    bag_counter = None
+    if bag_line:
+        bag_counter = make_bag_counter(bag_line, model=bag_model, model_lock=bag_model_lock)
+        active_streams[stream_id]['bag_counter'] = bag_counter
+        log({'type': 'info',
+             'message': f'Bag counting enabled on {stream_id} '
+                        f'(mode={bag_line.get("mode")}, '
+                        f'{"trained model" if bag_model else "no model"})'})
 
     reader = LatestFrameReader(rtsp_url)
     try:
@@ -877,6 +1006,10 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
 
             # 2. YOLO Incident Detection (General Objects + Heuristics)
             incidents = []
+            # Declared before the try so the plate and bag stages below still
+            # have something iterable if YOLO throws mid-frame.
+            people = []
+            vehicles = []  # (track_id, x1_px, y1_px, x2_px, y2_px, label) on small_frame coords
             try:
                 with yolo_lock:
                     # `track` (ByteTrack) with `persist=True` keeps track IDs stable
@@ -890,8 +1023,6 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
                     except Exception:
                         yolo_results = yolo_model(small_frame, verbose=False)[0]
 
-                    people = []
-                    vehicles = []  # (track_id, x1_px, y1_px, x2_px, y2_px, label) on small_frame coords
                     for box in yolo_results.boxes:
                         cls_id = int(box.cls[0])
                         conf = float(box.conf[0])
@@ -1153,6 +1284,39 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
             except Exception as ex:
                 log({'type': 'warning', 'message': f'Plate pipeline failed: {ex}'})
 
+            # 5. Conveyor bag counting. Runs last so it can veto motion blobs
+            # that overlap this frame's person boxes — workers walking beside
+            # the belt are the main false-positive source for the motion path.
+            bag_events = []
+            try:
+                # Pick up live enable/disable/edit pushed from the dashboard.
+                # `pop` so each edit is applied once; False means "disable".
+                pending = (active_streams.get(stream_id) or {}).pop('bag_line_pending', 'none')
+                if pending != 'none':
+                    if not pending:
+                        bag_counter = None
+                        (active_streams.get(stream_id) or {}).pop('bag_counter', None)
+                        log({'type': 'info', 'message': f'Bag counting disabled on {stream_id}'})
+                    elif bag_counter is None:
+                        bag_counter = make_bag_counter(pending, model=bag_model,
+                                                       model_lock=bag_model_lock)
+                        active_streams[stream_id]['bag_counter'] = bag_counter
+                        log({'type': 'info', 'message': f'Bag counting enabled on {stream_id}'})
+                    elif bag_counter.get_line().get('mode') != pending.get('mode'):
+                        # Mode change means a different class — set_line can only
+                        # move the geometry, so rebuild the counter.
+                        bag_counter = make_bag_counter(pending, model=bag_model,
+                                                       model_lock=bag_model_lock)
+                        active_streams[stream_id]['bag_counter'] = bag_counter
+                    else:
+                        bag_counter.set_line(pending)
+
+                if bag_counter is not None:
+                    bag_dets, bag_events = bag_counter.update(small_frame, people, now)
+                    detections.extend(bag_dets)
+            except Exception as ex:
+                log({'type': 'warning', 'message': f'Bag counter failed: {ex}'})
+
             # Snapshot decision — fire/smoke take priority and have their own,
             # tighter throttle; recognized faces are higher volume so the
             # throttle there is more generous. If both happen in the same
@@ -1173,13 +1337,19 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
                     if has_incident:   last_incident_snap_at = now_t
                     if has_named_face: last_face_snap_at     = now_t
 
-            log({
+            envelope = {
                 'type': 'detections',
                 'streamId': stream_id,
                 'detections': detections,
                 'incidents': incidents,
                 'snapshot': snapshot_path,
-            })
+            }
+            # Only present on frames where a bag actually crossed the line —
+            # this is a discrete event stream, not per-frame state. The backend
+            # owns the durable total (see bag_counter.py).
+            if bag_events:
+                envelope['bagEvents'] = bag_events
+            log(envelope)
     finally:
         reader.stop()
         log({'type': 'info', 'message': f'Stream worker stopped: {stream_id}'})
@@ -1201,12 +1371,24 @@ def main():
             url = cmd['rtspUrl']
             # Falls back to the legacy single-tenant root for older callers.
             enroll_dir = cmd.get('enrollmentDir') or ENROLLMENT_DIR
+            # Counting line for this camera, replayed by the backend on every
+            # worker restart. None/absent => bag counting off for this stream.
+            bag_line = normalize_bag_line(cmd.get('bagLine'))
             if sid not in active_streams:
                 stop_ev = threading.Event()
                 active_streams[sid] = {'stop': stop_ev}
-                t = threading.Thread(target=stream_worker, args=(sid, url, enroll_dir), daemon=True)
+                t = threading.Thread(target=stream_worker,
+                                     args=(sid, url, enroll_dir, bag_line), daemon=True)
                 t.start()
                 active_streams[sid]['thread'] = t
+        elif action == 'bagline':
+            # Enable / re-position / disable counting on a running stream
+            # without tearing down the RTSP capture. The worker loop picks the
+            # pending value up on its next processed frame.
+            sid = cmd.get('streamId')
+            if sid in active_streams:
+                line = normalize_bag_line(cmd.get('bagLine'))
+                active_streams[sid]['bag_line_pending'] = line if line else False
         elif action == 'remove':
             sid = cmd.get('streamId')
             if sid in active_streams:

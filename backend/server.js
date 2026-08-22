@@ -167,6 +167,71 @@ async function persistIncidents(streamId, detections, incidents, snapshotPath) {
   }
 }
 
+// ── Conveyor bag counting ────────────────────────────────────
+// Deliberately NOT routed through persistIncidents: that path throttles to one
+// row per (stream, type, name) per INCIDENT_THROTTLE_MS, which would silently
+// discard most of a belt's throughput. Crossings go straight into per-minute
+// buckets with no throttle.
+//
+// The running total lives in MySQL, not in the worker — the AI worker is
+// re-spawned and replayed on crash, so a total held there would reset to zero.
+// This Map is only a read-through cache of the DB sum.
+const bagTotals = new Map(); // streamId -> cumulative count since bag_reset_at
+
+async function loadBagTotal(streamId) {
+  try {
+    const [rows] = await db.getPool().query(
+      `SELECT COALESCE(SUM(bc.count), 0) AS total
+         FROM bag_counts bc
+         JOIN cameras c ON c.stream_id = bc.stream_id
+        WHERE bc.stream_id = ?
+          AND (c.bag_reset_at IS NULL OR bc.bucket_minute >= c.bag_reset_at)`,
+      [streamId],
+    );
+    const total = Number(rows[0]?.total || 0);
+    bagTotals.set(streamId, total);
+    return total;
+  } catch (err) {
+    console.error('[bags] total load failed:', err.message);
+    return bagTotals.get(streamId) || 0;
+  }
+}
+
+async function getBagTotal(streamId) {
+  const cached = bagTotals.get(streamId);
+  return cached === undefined ? loadBagTotal(streamId) : cached;
+}
+
+async function recordBagCrossings(streamId, events) {
+  const stream = activeStreams.get(streamId);
+  if (!stream || !Array.isArray(events) || events.length === 0) return;
+  const { userId, cameraName } = stream;
+
+  const features = await getUserFeatures(userId);
+  if (features.get('bag_counting') !== true) return;
+
+  const delta = events.length;
+  try {
+    // Bucket on the DB clock so buckets line up regardless of process timezone.
+    await db.getPool().query(
+      `INSERT INTO bag_counts (user_id, stream_id, bucket_minute, count)
+       VALUES (?, ?, DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:00'), ?)
+       ON DUPLICATE KEY UPDATE count = count + ?`,
+      [userId, streamId, delta, delta],
+    );
+  } catch (err) {
+    console.error('[bags] bucket upsert failed:', err.message);
+    return;
+  }
+
+  const total = (await getBagTotal(streamId)) + delta;
+  bagTotals.set(streamId, total);
+  emitToUser(userId, 'bag_count', {
+    streamId, cameraName, total, delta,
+    at: new Date().toISOString(),
+  });
+}
+
 // ── Single shared AI worker process ──────────────────────────
 let masterWorker = null;
 let workerBuf = '';
@@ -201,6 +266,10 @@ function startMasterWorker() {
             }).catch((err) => console.error('[detections] augment failed:', err.message));
           }
           persistIncidents(msg.streamId, msg.detections, msg.incidents, msg.snapshot).catch(() => {});
+          if (msg.bagEvents && msg.bagEvents.length > 0) {
+            recordBagCrossings(msg.streamId, msg.bagEvents)
+              .catch((err) => console.error('[bags] record failed:', err.message));
+          }
         } else {
           console.log(`[AI] ${msg.type}: ${msg.message || line}`);
         }
@@ -222,13 +291,16 @@ function startMasterWorker() {
     masterWorker = null;
     setTimeout(() => {
       startMasterWorker();
-      // Re-register all active streams after restart, with their per-user enrollment dirs
+      // Re-register all active streams after restart, with their per-user
+      // enrollment dirs and their bag counting lines — anything omitted here
+      // is silently lost for the rest of the process's life.
       for (const [streamId, s] of activeStreams) {
         sendWorkerCmd({
           cmd: 'add',
           streamId,
           rtspUrl: `rtsp://127.0.0.1:8554/${s.pathName}`,
           enrollmentDir: db.userEnrollmentDir(s.userId),
+          bagLine: s.bagLine || null,
         });
       }
     }, 3000);
@@ -349,6 +421,19 @@ app.post('/analyze-video', analyzeUpload.single('video'), async (req, res) => {
   if (!detectFire) args.push('--no-fire');
   if (useEnrollment) {
     args.push('--enrollment-dir', db.userEnrollmentDir(userId));
+  }
+  // Conveyor bag counting — off unless the client sends a line. Validated with
+  // the same parser the live route uses so a bad line is rejected here rather
+  // than crashing the analyzer 200 frames in.
+  const analyzeBagLine = parseBagLine(opts.bagLine);
+  if (analyzeBagLine) {
+    args.push('--bag-line', `${analyzeBagLine.x1},${analyzeBagLine.y1},${analyzeBagLine.x2},${analyzeBagLine.y2}`);
+    args.push('--bag-direction', analyzeBagLine.direction);
+    args.push('--bag-mode', analyzeBagLine.mode);
+    if (analyzeBagLine.roi) {
+      const r = analyzeBagLine.roi;
+      args.push('--bag-roi', `${r.x},${r.y},${r.w},${r.h}`);
+    }
   }
 
   const job = {
@@ -554,7 +639,7 @@ app.delete('/analyze-video/:id', (req, res) => {
 });
 
 // ── Camera helpers ────────────────────────────────────────────
-async function spawnCameraStack({ userId, streamId, pathName, rtspUrl, cameraName }) {
+async function spawnCameraStack({ userId, streamId, pathName, rtspUrl, cameraName, bagLine }) {
   // 1. Tell MediaMTX to register the path
   try {
     await axios.post(`${MEDIAMTX_API}/v3/config/paths/add/${pathName}`, {});
@@ -569,14 +654,25 @@ async function spawnCameraStack({ userId, streamId, pathName, rtspUrl, cameraNam
   }
 
   const localRtspUrl = `rtsp://127.0.0.1:8554/${pathName}`;
-  activeStreams.set(streamId, { userId, cameraName, rtspUrl, pathName, hlsUrl: `${HLS_BASE}/${pathName}/` });
+  const normalizedBagLine = parseBagLine(bagLine);
+  activeStreams.set(streamId, {
+    userId, cameraName, rtspUrl, pathName,
+    hlsUrl: `${HLS_BASE}/${pathName}/`,
+    // Kept in memory so the worker-restart replay can re-send it.
+    bagLine: normalizedBagLine,
+  });
 
   sendWorkerCmd({
     cmd: 'add',
     streamId,
     rtspUrl: localRtspUrl,
     enrollmentDir: db.userEnrollmentDir(userId),
+    bagLine: normalizedBagLine,
   });
+
+  // Warm the counter cache so the first frontend poll shows the real total
+  // rather than 0 until the next bag crosses.
+  if (normalizedBagLine) loadBagTotal(streamId).catch(() => {});
 
   const backendUrl = `http://127.0.0.1:${PORT}`;
   console.log(`[Backend] Auto-starting agent for: ${cameraName} (user ${userId})`);
@@ -620,6 +716,54 @@ function parseCoord(v, min, max) {
   const n = Number(v);
   if (!isFinite(n) || n < min || n > max) return null;
   return n;
+}
+
+// Mirror of bag_counter.normalize_line() on the Python side. Accepts a parsed
+// object or the raw JSON string stored in cameras.bag_line_json, and returns
+// null for anything the counter can't use — including a zero-length segment,
+// which has no "side" and could never register a crossing.
+const BAG_DIRECTIONS = new Set(['both', 'positive', 'negative']);
+// 'gate' = occupancy tripwire on the line; 'track' = blob detection + tracking.
+// Gate is the default because it measured 47/47 against 13/47 for track on real
+// belt footage — see the docstring in face-ai/bag_counter.py.
+const BAG_MODES = new Set(['gate', 'track']);
+const DEFAULT_BAG_LINE = { x1: 0.05, y1: 0.72, x2: 0.95, y2: 0.72, direction: 'both', roi: null, mode: 'gate' };
+
+function parseBagLine(spec) {
+  if (!spec) return null;
+  let src = spec;
+  if (typeof src === 'string') {
+    try { src = JSON.parse(src); } catch { return null; }
+  }
+  if (typeof src !== 'object') return null;
+
+  const unit = (v) => {
+    const n = Number(v);
+    return isFinite(n) ? Math.max(0, Math.min(1, n)) : null;
+  };
+  const x1 = unit(src.x1), y1 = unit(src.y1), x2 = unit(src.x2), y2 = unit(src.y2);
+  if ([x1, y1, x2, y2].some((v) => v === null)) return null;
+  if (Math.abs(x2 - x1) < 1e-6 && Math.abs(y2 - y1) < 1e-6) return null;
+  // A line along a frame edge can never be crossed — track centroids are always
+  // strictly inside the frame. Mirrors the EDGE_EPS check in bag_counter.py.
+  const EDGE_EPS = 0.01;
+  if (Math.max(y1, y2) <= EDGE_EPS || Math.min(y1, y2) >= 1 - EDGE_EPS
+      || Math.max(x1, x2) <= EDGE_EPS || Math.min(x1, x2) >= 1 - EDGE_EPS) {
+    return null;
+  }
+
+  const direction = BAG_DIRECTIONS.has(src.direction) ? src.direction : 'both';
+
+  let roi = null;
+  if (src.roi && typeof src.roi === 'object') {
+    const rx = unit(src.roi.x), ry = unit(src.roi.y);
+    const rw = unit(src.roi.w), rh = unit(src.roi.h);
+    if ([rx, ry, rw, rh].every((v) => v !== null) && rw > 0.05 && rh > 0.05) {
+      roi = { x: rx, y: ry, w: Math.min(rw, 1 - rx), h: Math.min(rh, 1 - ry) };
+    }
+  }
+  const mode = BAG_MODES.has(src.mode) ? src.mode : 'gate';
+  return { x1, y1, x2, y2, direction, roi, mode };
 }
 
 app.post('/add-camera', async (req, res) => {
@@ -677,15 +821,145 @@ app.delete('/camera/:id', async (req, res) => {
 app.get('/cameras', async (req, res) => {
   const userId = req.user.uid;
   const [rows] = await db.getPool().query(
-    'SELECT stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName, lat, lng FROM cameras WHERE user_id = ?',
+    'SELECT stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName, lat, lng, bag_line_json AS bagLineJson FROM cameras WHERE user_id = ?',
     [userId],
   );
-  res.json(rows.map((r) => ({
-    ...r,
-    lat: r.lat == null ? null : Number(r.lat),
-    lng: r.lng == null ? null : Number(r.lng),
-    hlsUrl: `${HLS_BASE}/${r.pathName}/`,
-  })));
+  const out = [];
+  for (const r of rows) {
+    const bagLine = parseBagLine(r.bagLineJson);
+    out.push({
+      streamId: r.streamId,
+      cameraName: r.cameraName,
+      rtspUrl: r.rtspUrl,
+      pathName: r.pathName,
+      lat: r.lat == null ? null : Number(r.lat),
+      lng: r.lng == null ? null : Number(r.lng),
+      hlsUrl: `${HLS_BASE}/${r.pathName}/`,
+      bagLine,
+      // Only meaningful when a line is configured; null keeps the tile chip hidden.
+      bagTotal: bagLine ? await getBagTotal(r.streamId) : null,
+    });
+  }
+  res.json(out);
+});
+
+// ── Conveyor bag counting routes ──────────────────────────────
+// PUT /camera/:id/bag-line
+//   body: { enabled?: bool, x1, y1, x2, y2, direction?, roi? }
+// Enabling without coordinates stores DEFAULT_BAG_LINE so a user can switch a
+// conveyor camera on in one click and drag the line afterwards. The worker is
+// updated live (`bagline` cmd) — no stream restart, no dropped frames.
+app.put('/camera/:id/bag-line', async (req, res) => {
+  const userId = req.user.uid;
+  const { id } = req.params;
+  const body = req.body || {};
+
+  const [owned] = await db.getPool().query(
+    'SELECT stream_id FROM cameras WHERE stream_id = ? AND user_id = ? LIMIT 1',
+    [id, userId],
+  );
+  if (owned.length === 0) return res.status(404).json({ error: 'camera not found' });
+
+  let line = null;
+  if (body.enabled !== false) {
+    line = parseBagLine(body) || (body.enabled === true ? { ...DEFAULT_BAG_LINE } : null);
+    if (!line) {
+      return res.status(400).json({
+        error: 'a valid line requires x1,y1,x2,y2 in 0..1 and must not be zero-length',
+      });
+    }
+  }
+
+  try {
+    await db.getPool().query(
+      'UPDATE cameras SET bag_line_json = ? WHERE stream_id = ? AND user_id = ?',
+      [line ? JSON.stringify(line) : null, id, userId],
+    );
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+
+  const stream = activeStreams.get(id);
+  if (stream) stream.bagLine = line;
+  sendWorkerCmd({ cmd: 'bagline', streamId: id, bagLine: line });
+
+  res.json({ streamId: id, bagLine: line, bagTotal: line ? await getBagTotal(id) : null });
+});
+
+// Non-destructive reset: stamps a cutoff instead of deleting buckets, so the
+// throughput history stays queryable while the live counter returns to zero.
+app.post('/camera/:id/bag-count/reset', async (req, res) => {
+  const userId = req.user.uid;
+  const { id } = req.params;
+  try {
+    const [r] = await db.getPool().query(
+      'UPDATE cameras SET bag_reset_at = NOW() WHERE stream_id = ? AND user_id = ?',
+      [id, userId],
+    );
+    if (r.affectedRows === 0) return res.status(404).json({ error: 'camera not found' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  const total = await loadBagTotal(id);
+  emitToUser(userId, 'bag_count', {
+    streamId: id,
+    cameraName: activeStreams.get(id)?.cameraName || null,
+    total, delta: 0, at: new Date().toISOString(),
+  });
+  res.json({ streamId: id, total });
+});
+
+// GET /bag-counts?streamId=&hours=24&bucket=minute|hour|day
+// Time series for the throughput chart, plus per-camera totals.
+app.get('/bag-counts', async (req, res) => {
+  const userId = req.user.uid;
+  const hours = Math.max(1, Math.min(24 * 90, Number(req.query.hours) || 24));
+  const bucket = ['minute', 'hour', 'day'].includes(req.query.bucket) ? req.query.bucket : 'hour';
+  const fmt = bucket === 'minute' ? '%Y-%m-%d %H:%i:00'
+            : bucket === 'day'    ? '%Y-%m-%d 00:00:00'
+            :                       '%Y-%m-%d %H:00:00';
+
+  const params = [userId, hours];
+  let streamFilter = '';
+  if (req.query.streamId) {
+    streamFilter = ' AND bc.stream_id = ?';
+    params.push(req.query.streamId);
+  }
+
+  try {
+    const [series] = await db.getPool().query(
+      `SELECT DATE_FORMAT(bc.bucket_minute, '${fmt}') AS bucket,
+              SUM(bc.count) AS count
+         FROM bag_counts bc
+         JOIN cameras c ON c.stream_id = bc.stream_id
+        WHERE bc.user_id = ?
+          AND bc.bucket_minute >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+          AND (c.bag_reset_at IS NULL OR bc.bucket_minute >= c.bag_reset_at)
+          ${streamFilter}
+        GROUP BY bucket
+        ORDER BY bucket ASC`,
+      params,
+    );
+    const [byCamera] = await db.getPool().query(
+      `SELECT bc.stream_id AS streamId, c.camera_name AS cameraName,
+              SUM(bc.count) AS total
+         FROM bag_counts bc
+         JOIN cameras c ON c.stream_id = bc.stream_id
+        WHERE bc.user_id = ?
+          AND (c.bag_reset_at IS NULL OR bc.bucket_minute >= c.bag_reset_at)
+        GROUP BY bc.stream_id, c.camera_name
+        ORDER BY total DESC`,
+      [userId],
+    );
+    res.json({
+      bucket,
+      series: series.map((r) => ({ bucket: r.bucket, count: Number(r.count) })),
+      byCamera: byCamera.map((r) => ({ ...r, total: Number(r.total) })),
+      total: byCamera.reduce((a, r) => a + Number(r.total), 0),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Update an existing camera's location (used by the map's "drag pin" UX
@@ -1388,7 +1662,7 @@ const DEMO_RTSP_PREFIX = 'rtsp://demo.';
 
 async function bootstrapCamerasFromDb() {
   const [rows] = await db.getPool().query(
-    'SELECT user_id AS userId, stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName FROM cameras',
+    'SELECT user_id AS userId, stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName, bag_line_json AS bagLine FROM cameras',
   );
   let real = 0, demo = 0;
   for (const c of rows) {

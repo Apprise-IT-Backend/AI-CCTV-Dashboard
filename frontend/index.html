@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="vendor/leaflet.css">
   <!-- Cache-bust: bump the ?v= number whenever style.css changes so browsers don't
        serve a stale copy. Frontend has no build step so this is manual. -->
-  <link rel="stylesheet" href="style.css?v=3">
+  <link rel="stylesheet" href="style.css?v=4">
   <!-- Inter font from Google Fonts is non-blocking: if offline / air-gapped,
        the CSS font stack falls back to system-ui (still looks clean). -->
   <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
@@ -58,6 +58,8 @@
     <symbol id="i-arrow-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
     <symbol id="i-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></symbol>
     <symbol id="i-logout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
     <symbol id="i-car" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17h14M3 17v-5l2-5h14l2 5v5"/><circle cx="7.5" cy="17.5" r="1.5"/><circle cx="16.5" cy="17.5" r="1.5"/></symbol>
   </svg>
 
@@ -612,6 +614,28 @@
                 <input type="checkbox" id="analyze-fire">
                 <span>Detect fire / smoke (off by default — noisy on daytime footage)</span>
               </label>
+              <label class="analyze-checkbox">
+                <input type="checkbox" id="analyze-bags">
+                <span>Count conveyor bags crossing a line</span>
+              </label>
+              <!-- Line picker: appears only when the checkbox is on and a file
+                   is selected. The user clicks two points on a real frame of
+                   their own clip, so the coordinates can't be guessed wrong. -->
+              <div class="analyze-bagline" id="analyze-bagline" style="display:none">
+                <div class="analyze-bagline-stage" id="analyze-bagline-stage">
+                  <canvas id="analyze-bagline-canvas"></canvas>
+                  <div class="analyze-bagline-hint" id="analyze-bagline-hint">Click the two ends of the counting line</div>
+                </div>
+                <div class="analyze-bagline-row">
+                  <span class="analyze-bagline-status" id="analyze-bagline-status">No line set</span>
+                  <select id="analyze-bag-direction" title="Which crossing sense counts">
+                    <option value="both">Count both directions</option>
+                    <option value="positive">Count one way only</option>
+                    <option value="negative">Count one way (reversed)</option>
+                  </select>
+                  <button type="button" class="btn-secondary" id="analyze-bagline-clear">Redraw</button>
+                </div>
+              </div>
             </div>
 
             <button class="btn-primary" id="analyze-submit" disabled>Analyze</button>
@@ -847,10 +871,15 @@
   <div id="tile-menu" class="popup-menu" style="display:none">
     <button data-action="screenshot"><svg><use href="#i-screenshot"/></svg>Take screenshot</button>
     <button data-action="fullscreen"><svg><use href="#i-fullscreen"/></svg>Open fullscreen</button>
+    <button data-action="bagline"><svg><use href="#i-box"/></svg><span class="bagline-label">Set bag counting line</span></button>
+    <button data-action="bagmode" class="bag-only"><svg><use href="#i-refresh"/></svg><span class="bagmode-label">Counting mode</span></button>
+    <button data-action="bagdirection" class="bag-only bag-track-only"><svg><use href="#i-arrow-down"/></svg><span class="bagdir-label">Counting direction</span></button>
+    <button data-action="bagreset" class="bag-only"><svg><use href="#i-refresh"/></svg>Reset bag count</button>
+    <button data-action="bagoff" class="bag-only"><svg><use href="#i-x"/></svg>Turn off bag counting</button>
     <button data-action="remove" class="danger"><svg><use href="#i-x"/></svg>Remove camera</button>
   </div>
 
   <!-- Same cache-bust rule as style.css above — bump the ?v= number when app.js changes. -->
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>

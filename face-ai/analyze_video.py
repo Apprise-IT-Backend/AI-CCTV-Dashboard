@@ -42,6 +42,7 @@ sys.stdout = _real_stdout
 
 import cv2, numpy as np
 import mediapipe as mp
+import bag_counter  # conveyor counting — same implementation the live worker uses
 
 # Silence the JSON `log()` calls that stream from inside the pipeline once
 # we start running — keep our progress output clean.
@@ -56,6 +57,14 @@ COLOR_LOITERING  = (60, 146, 251)     # #fb923c
 COLOR_VEHICLE    = (184, 163, 148)    # #94a3b8
 COLOR_PLATE      = (238, 210, 34)     # #22d3ee
 COLOR_INCIDENT   = (68, 68, 239)      # #ef4444
+COLOR_BAG        = (250, 139, 167)    # #a78bfa — uncounted bag
+COLOR_BAG_DONE   = (137, 211, 52)     # #34d399 — already tallied
+COLOR_BAG_LINE   = (182, 114, 244)    # #f472b6 — the counting line
+
+# Max individual bag crossings listed in the summary envelope. The *total* is
+# always exact; this only bounds the per-bag timestamp list so a 3000-bag clip
+# doesn't ship a multi-megabyte JSON payload to the browser.
+BAG_EVENT_CAP = 500
 
 # ── Plate OCR tuning (analyzer only) ──────────────────────
 # The live pipeline in detect.py is conservative — wants two agreeing reads
@@ -113,7 +122,7 @@ def draw_label(img, x, y, text, color, above=True):
 def process_video(input_path, output_path, enrollment_dir=None,
                   downscale=0.5, loitering_seconds=30, progress_json=False,
                   detect_fire=True, person_conf=0.4, person_min_area=0.005,
-                  yolo_model_path=None, yolo_imgsz=None):
+                  yolo_model_path=None, yolo_imgsz=None, bag_line=None):
     # First-run "Best" quality auto-downloads ~52 MB of weights and loads a
     # much heavier model — the whole warmup can take 30-60s on CPU during
     # which no `progress` lines are emitted. Signal a phase change up front
@@ -206,6 +215,25 @@ def process_video(input_path, output_path, enrollment_dir=None,
     fire_prev_sig = None
     fire_streak   = 0
 
+    # ── Conveyor bag counting (opt-in: needs a counting line) ──
+    # Same BagCounter as the live worker, so a count verified here is the count
+    # you get on the stream. Note the analyzer processes EVERY frame while the
+    # live worker throttles to 8 fps — tracking gets easier at higher cadence,
+    # not harder, so thresholds transfer as-is.
+    bag_line_norm = bag_counter.normalize_line(bag_line) if bag_line else None
+    bag_ctr = None
+    bag_total = 0
+    if bag_line_norm:
+        bag_ctr = bag_counter.make_counter(bag_line_norm,
+                                           model=detect.bag_model,
+                                           model_lock=detect.bag_model_lock)
+        print(f'Bags: mode={bag_line_norm["mode"]}, counting across '
+              f'({bag_line_norm["x1"]:.2f},{bag_line_norm["y1"]:.2f})-'
+              f'({bag_line_norm["x2"]:.2f},{bag_line_norm["y2"]:.2f}) '
+              f'dir={bag_line_norm["direction"]} '
+              f'roi={"yes" if bag_line_norm["roi"] else "full frame"} '
+              f'[{"trained model" if detect.bag_model else "motion fallback"}]')
+
     # ── Summary state (emitted at end of job) ──────────────────
     # Counters + keyframe snapshots that the UI shows under the video player.
     # We save one small (~480px wide) JPEG per notable "first occurrence" so the
@@ -223,6 +251,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
         'plates': {},       # plate string -> {'count', 'snap', 'first_s', 'vehicleType'}
         'loitering': [],    # list of {'trackId', 'first_s', 'peak_dwell_s', 'snap'}
         'fire': [],         # list of {'first_s', 'snap'}
+        # Conveyor crossings: one entry per counted bag. A busy belt produces
+        # thousands, so the emitted list is capped (see BAG_EVENT_CAP) while the
+        # total stays exact.
+        'bags': [],         # list of {'n', 't', 'trackId', 'direction'}
         '_loitering_seen': set(),
     }
 
@@ -826,9 +858,38 @@ def process_video(input_path, output_path, enrollment_dir=None,
                 summary['fire'].append(new_fire)
                 pending_keyframes.append((f'fire-{frame_idx}', new_fire, 'snap', None))
 
+        # ── Conveyor bag counting ────────────────────────────
+        # Runs after the person stage so its motion blobs can be vetoed against
+        # this frame's person boxes (workers beside the belt are the dominant
+        # false positive). Bag boxes join `detections` so the draw loop below
+        # renders them like everything else.
+        if bag_ctr is not None:
+            try:
+                person_boxes = [
+                    [d['x'], d['y'], d['x'] + d['w'], d['y'] + d['h']]
+                    for d in detections if d.get('label') == 'person'
+                ]
+                bag_dets, bag_events = bag_ctr.update(small, person_boxes, now)
+                detections.extend(bag_dets)
+                for ev in bag_events:
+                    bag_total += 1
+                    if len(summary['bags']) < BAG_EVENT_CAP:
+                        summary['bags'].append({
+                            'n': bag_total, 't': round(now, 2),
+                            'trackId': ev['trackId'], 'direction': ev['direction'],
+                        })
+            except Exception as ex:
+                print(f'  [warn] bag counter failed at frame {frame_idx}: {ex}',
+                      file=sys.stderr)
+
         # ── Draw on the full-res output frame ─────────────────
         H, W = frame.shape[:2]
         out = frame  # in-place is fine, we don't reuse original
+        if bag_line_norm:
+            cv2.line(out,
+                     (int(bag_line_norm['x1'] * W), int(bag_line_norm['y1'] * H)),
+                     (int(bag_line_norm['x2'] * W), int(bag_line_norm['y2'] * H)),
+                     COLOR_BAG_LINE, 2)
         for d in detections:
             x1 = int(d['x'] * W); y1 = int(d['y'] * H)
             x2 = int((d['x'] + d['w']) * W); y2 = int((d['y'] + d['h']) * H)
@@ -836,6 +897,9 @@ def process_video(input_path, output_path, enrollment_dir=None,
             if d.get('loitering'):
                 color = COLOR_LOITERING
                 tag = f"LOITERING {d.get('dwellSeconds', '')}s"
+            elif lab == 'bag':
+                color = COLOR_BAG_DONE if d.get('counted') else COLOR_BAG
+                tag = f"bag#{d['trackId']}" if d.get('trackId') is not None else 'bag'
             elif lab == 'plate':
                 color = COLOR_PLATE
                 tag = f"PLATE {d['name']}" if d.get('name') else 'plate'
@@ -874,6 +938,8 @@ def process_video(input_path, output_path, enrollment_dir=None,
 
         # HUD — top-left timestamp so you can find events after the fact.
         hud = f"t={now:6.2f}s  frame {frame_idx}/{n_frames}"
+        if bag_ctr is not None:
+            hud += f"  bags={bag_total}"
         cv2.putText(out, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(out, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -1049,6 +1115,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
                 'plates_read': len(summary['plates']),
                 'loitering_events': len(summary['loitering']),
                 'fire_events': len(summary['fire']),
+                # Omitted entirely when no counting line was supplied — the UI
+                # uses its absence to hide the tile, so a "0" always means
+                # "counting ran and found nothing", never "counting was off".
+                **({'bags_counted': bag_total} if bag_ctr is not None else {}),
             },
             'persons':  persons_list,
             'vehicles': vehicles_list,
@@ -1063,6 +1133,8 @@ def process_video(input_path, output_path, enrollment_dir=None,
             ],
             'loitering': summary['loitering'],
             'fire': summary['fire'],
+            'bags': summary['bags'],
+            'bagsTruncated': bag_total > len(summary['bags']),
         }
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     else:
@@ -1073,6 +1145,10 @@ def process_video(input_path, output_path, enrollment_dir=None,
         print(f"Plates read: {len(summary['plates'])} — {', '.join(summary['plates'].keys())}")
         print(f"Loitering events: {len(summary['loitering'])}")
         print(f"Fire/smoke events: {len(summary['fire'])}")
+        if bag_ctr is not None:
+            clip_s = frame_idx / src_fps if src_fps else 0
+            rate = (bag_total / clip_s * 60.0) if clip_s > 0 else 0
+            print(f"Bags counted: {bag_total}  ({rate:.1f} bags/min over {clip_s:.1f}s)")
 
     return 0
 
@@ -1149,7 +1225,40 @@ def main():
                     help='YOLO inference resolution. Default 640 (ultralytics default). '
                          'Push to 960 or 1280 to catch distant/small people — CPU cost '
                          'scales ~quadratically.')
+    ap.add_argument('--bag-line', default=None,
+                    help='Enable conveyor bag counting across this line, as '
+                         'x1,y1,x2,y2 in 0..1 relative coords. Omit to disable '
+                         'counting entirely.')
+    ap.add_argument('--bag-roi', default=None,
+                    help='Restrict bag detection to x,y,w,h in 0..1 (the belt). '
+                         'Strongly recommended — everything outside is ignored.')
+    ap.add_argument('--bag-direction', default='both',
+                    choices=bag_counter.VALID_DIRECTIONS,
+                    help='Which crossing sense counts. Default both. track mode only.')
+    ap.add_argument('--bag-mode', default=bag_counter.BAG_COUNT_MODE,
+                    choices=bag_counter.VALID_MODES,
+                    help='gate (default) = occupancy tripwire on the line, accurate on a '
+                         'loaded belt. track = per-bag boxes and IDs, but loses counts '
+                         'when bags touch.')
     args = ap.parse_args()
+
+    bag_line = None
+    if args.bag_line:
+        nums = [p.strip() for p in args.bag_line.split(',') if p.strip()]
+        if len(nums) != 4:
+            print('ERROR: --bag-line needs x1,y1,x2,y2', file=sys.stderr); return 1
+        bag_line = {'x1': nums[0], 'y1': nums[1], 'x2': nums[2], 'y2': nums[3],
+                    'direction': args.bag_direction, 'roi': None,
+                    'mode': args.bag_mode}
+        if args.bag_roi:
+            r = [p.strip() for p in args.bag_roi.split(',') if p.strip()]
+            if len(r) != 4:
+                print('ERROR: --bag-roi needs x,y,w,h', file=sys.stderr); return 1
+            bag_line['roi'] = {'x': r[0], 'y': r[1], 'w': r[2], 'h': r[3]}
+        if bag_counter.normalize_line(bag_line) is None:
+            print('ERROR: --bag-line is unusable (zero-length or non-numeric)',
+                  file=sys.stderr)
+            return 1
 
     if not os.path.isfile(args.input):
         print(f'ERROR: input not found: {args.input}', file=sys.stderr); return 1
@@ -1166,7 +1275,8 @@ def main():
                          person_conf=args.person_conf,
                          person_min_area=args.person_min_area,
                          yolo_model_path=args.yolo_model,
-                         yolo_imgsz=args.yolo_imgsz)
+                         yolo_imgsz=args.yolo_imgsz,
+                         bag_line=bag_line)
 
 
 if __name__ == '__main__':

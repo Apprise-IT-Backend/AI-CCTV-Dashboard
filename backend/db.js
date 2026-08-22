@@ -17,6 +17,7 @@ const DEFAULT_FEATURES = [
   { name: 'person_detection', enabled: 0, description: 'Log person presence (high volume — off by default)' },
   { name: 'loitering_detection', enabled: 1, description: 'Log persons that dwell in-frame beyond LOITERING_SECONDS (default 30s)' },
   { name: 'plate_detection', enabled: 1, description: 'Log recognized Bangla / English license plates from vehicles in view' },
+  { name: 'bag_counting', enabled: 1, description: 'Count conveyor bags crossing a camera\'s counting line (per-camera line required)' },
 ];
 
 let pool;
@@ -78,6 +79,30 @@ async function init() {
   // Backfill the columns on installs that were created before lat/lng existed.
   await ensureColumn('cameras', 'lat', 'DECIMAL(10, 7) NULL');
   await ensureColumn('cameras', 'lng', 'DECIMAL(10, 7) NULL');
+  // Bag counting is opt-in per camera: NULL here means "not a conveyor camera"
+  // and the AI worker skips the pipeline entirely for that stream.
+  await ensureColumn('cameras', 'bag_line_json', 'TEXT NULL');
+  // "Reset counter" is non-destructive — it stamps a cutoff instead of deleting
+  // buckets, so throughput history survives a reset.
+  await ensureColumn('cameras', 'bag_reset_at', 'DATETIME NULL');
+
+  // ── bag_counts: conveyor throughput, aggregated per minute ─
+  // One row per (stream, minute) rather than per bag: a busy belt does
+  // thousands of bags an hour, and per-minute buckets are what the throughput
+  // chart actually needs. The cumulative total is SUM(count) over the buckets
+  // after the camera's bag_reset_at, so it survives a backend restart.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bag_counts (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      stream_id VARCHAR(64) NOT NULL,
+      bucket_minute DATETIME NOT NULL,
+      count INT NOT NULL DEFAULT 0,
+      UNIQUE KEY uniq_stream_bucket (stream_id, bucket_minute),
+      INDEX idx_user (user_id),
+      INDEX idx_bucket (bucket_minute)
+    ) ENGINE=InnoDB
+  `);
 
   // ── enrollments: per-person metadata (type, notes) ────────
   // The actual face images live on disk in face-ai/enrollments/<user_id>/.

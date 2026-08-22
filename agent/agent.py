@@ -34,6 +34,17 @@ import re
 import zipfile
 import shutil
 
+# When the backend spawns this agent, our stdout/stderr are pipes that Python
+# defaults to the OS ANSI codepage (cp1252 on Windows). Any non-ASCII byte in a
+# print() — e.g. the "->" arrow in a status line — then raises
+# UnicodeEncodeError and kills the agent before FFmpeg even starts. Force UTF-8
+# with replacement so a log line can never crash the bridge.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
 def get_server_host(server_url):
     """Extracts just the hostname/IP from a full URL like http://1.2.3.4:3000"""
     match = re.match(r'https?://([^:/]+)', server_url)
@@ -68,6 +79,22 @@ def get_ffmpeg_command():
 
     return None
 
+def get_ffprobe_command():
+    """Finds the ffprobe executable next to ffmpeg (portable zip ships both)."""
+    try:
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        return 'ffprobe'
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    for p in [os.path.join(here, 'ffprobe.exe'), os.path.join(root, 'ffprobe.exe')]:
+        if os.path.exists(p):
+            return p
+
+    return None
+
 def download_ffmpeg():
     """Downloads a portable ffmpeg.exe for Windows if missing."""
     if os.name != 'nt':
@@ -93,13 +120,18 @@ def download_ffmpeg():
         if not zipfile.is_zipfile(zip_path):
             raise RuntimeError("downloaded file is not a valid zip — try again or install ffmpeg manually")
 
-        print("[Agent] Extracting ffmpeg.exe...")
+        print("[Agent] Extracting ffmpeg.exe + ffprobe.exe...")
+        probe_target = os.path.join(here, "ffprobe.exe")
         with zipfile.ZipFile(zip_path, 'r') as z:
             exe_member = next((m for m in z.namelist() if m.endswith('bin/ffmpeg.exe')), None)
             if not exe_member:
                 raise RuntimeError("zip did not contain bin/ffmpeg.exe (unexpected build layout)")
             with z.open(exe_member) as source, open(target, 'wb') as dest:
                 shutil.copyfileobj(source, dest)
+            probe_member = next((m for m in z.namelist() if m.endswith('bin/ffprobe.exe')), None)
+            if probe_member:
+                with z.open(probe_member) as source, open(probe_target, 'wb') as dest:
+                    shutil.copyfileobj(source, dest)
 
         if not os.path.exists(target) or os.path.getsize(target) < 1_000_000:
             raise RuntimeError("ffmpeg.exe extracted but looks truncated")
@@ -163,13 +195,49 @@ def _ffmpeg_rtsp_timeout_flag(ffmpeg_cmd):
     return _ffmpeg_timeout_flag_cache
 
 
-def run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url):
+def probe_source_video_codec(ffprobe_cmd, local_rtsp):
+    """Return the source's video codec name (e.g. 'h264', 'hevc') or None on failure.
+
+    Browsers can only play H.264 reliably over HLS/WebRTC. If the camera pushes
+    H.265/HEVC, MJPEG, etc., a `-c copy` bridge produces a manifest the browser
+    can't decode (black tile), even though the CV worker — which uses OpenCV's
+    full decoder — still gets frames. Probing lets us keep the fast copy path
+    for H.264 and only pay transcode cost when we have to.
+    """
+    if not ffprobe_cmd:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                ffprobe_cmd,
+                '-v', 'error',
+                '-rtsp_transport', 'tcp',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name',
+                '-of', 'default=nw=1:nk=1',
+                local_rtsp,
+            ],
+            capture_output=True, text=True, timeout=12,
+        )
+        name = (out.stdout or '').strip().splitlines()[0].strip().lower() if out.stdout else ''
+        return name or None
+    except Exception as e:
+        print(f"[Agent] ffprobe failed ({e}); assuming transcode is needed.")
+        return None
+
+
+def run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url, source_codec):
     """Start FFmpeg to bridge local RTSP → remote MediaMTX.
 
     `-stimeout` is critical: without it, if the camera goes silent (phone
     sleeps, app closes, network blip), ffmpeg's RTSP read can block forever
     and our retry loop never sees an exit. 5s in microseconds is plenty for
     a healthy camera but bounded enough to recover quickly.
+
+    If the source video codec is already H.264 we `-c copy` (zero CPU). For
+    anything else — or an unknown probe result — we transcode to H.264 so the
+    browser's HLS/WebRTC path can actually render frames. Audio is dropped
+    (`-an`); CCTV doesn't need it and it removes a whole class of codec issues.
     """
     # ffmpeg 5+ uses `-timeout`; older builds use `-stimeout`. Both are RTSP
     # socket-IO timeouts in microseconds. We pick at runtime by sniffing the
@@ -181,13 +249,27 @@ def run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url):
         '-rtsp_transport', 'tcp',
         _ffmpeg_rtsp_timeout_flag(ffmpeg_cmd), '5000000',
         '-i', local_rtsp,
-        '-c', 'copy',
+    ]
+    if source_codec == 'h264':
+        cmd += ['-c', 'copy']
+        mode = 'copy (source is H.264)'
+    else:
+        cmd += [
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-tune', 'zerolatency',
+            '-pix_fmt', 'yuv420p',
+            '-g', '30',
+            '-an',
+        ]
+        mode = f"transcode -> H.264 (source is {source_codec or 'unknown'})"
+    cmd += [
         # Output (MediaMTX) options
         '-f', 'rtsp',
         '-rtsp_transport', 'tcp',
         push_url,
     ]
-    print(f"[Agent] Bridging stream:")
+    print(f"[Agent] Bridging stream ({mode}):")
     print(f"  Source  : {local_rtsp}")
     print(f"  Destination: {push_url}")
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -219,6 +301,10 @@ def main():
         time.sleep(1)
     print(f"[Agent] Stream registered. Connecting FFmpeg...")
 
+    ffprobe_cmd = get_ffprobe_command()
+    source_codec = probe_source_video_codec(ffprobe_cmd, local_rtsp)
+    print(f"[Agent] Source video codec: {source_codec or 'unknown'}")
+
     running = True
 
     def handle_sigint(sig, frame):
@@ -232,7 +318,7 @@ def main():
     retry_delay = 5
 
     while running:
-        proc = run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url)
+        proc = run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url, source_codec)
 
         for line in proc.stdout:
             txt = line.rstrip()
